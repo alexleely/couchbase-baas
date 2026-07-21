@@ -1,0 +1,98 @@
+version: '3.8'
+
+services:
+  # Couchbase Server 7.x Database Node
+  couchbase:
+    image: couchbase/server:community-7.2.0
+    container_name: cb-platform-db
+    ports:
+      - "8091-8096:8091-8096" # Management Web Console & APIs
+      - "11210:11210"         # Data Service KV operations
+    environment:
+      - CB_AUTO_FAILOVER_TIMEOUT=120
+    volumes:
+      - cbdata:/opt/couchbase/var
+
+  # MinIO S3 Object Storage Backend
+  minio:
+    image: minio/minio:RELEASE.2024-01-31T03-24-41Z
+    container_name: cb-platform-minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadminpassword
+    volumes:
+      - miniodata:/data
+
+  # API Gateway Router
+  gateway:
+    build:
+      context: ./services/gateway
+    container_name: cb-platform-gateway
+    ports:
+      - "8000:8000"
+    environment:
+      - PORT=8000
+    depends_on:
+      - couchbase
+
+  # Auth Service (Identity, OIDC, SAML)
+  auth:
+    build:
+      context: ./services/auth
+    container_name: cb-platform-auth
+    ports:
+      - "8001:8001"
+    environment:
+      - PORT=8001
+      - COUCHBASE_CONN_STR=couchbase://couchbase
+    depends_on:
+      - couchbase
+
+  # Data API Service (Auto REST & SQL++)
+  data:
+    build:
+      context: ./services/data
+    container_name: cb-platform-data
+    ports:
+      - "8002:8002"
+    environment:
+      - PORT=8002
+      - COUCHBASE_CONN_STR=couchbase://couchbase
+    depends_on:
+      - couchbase
+
+  # Realtime WebSocket & Change Stream Service
+  realtime:
+    build:
+      context: ./services/realtime
+    container_name: cb-platform-realtime
+    ports:
+      - "8003:8003"
+    environment:
+      - PORT=8003
+      - COUCHBASE_CONN_STR=couchbase://couchbase
+    depends_on:
+      - couchbase
+
+  # Storage Service (Metadata & Binary Objects)
+  storage:
+    build:
+      context: ./services/storage
+    container_name: cb-platform-storage
+    ports:
+      - "8004:8004"
+    environment:
+      - PORT=8004
+      - S3_ENDPOINT=http://minio:9000
+      - COUCHBASE_CONN_STR=couchbase://couchbase
+    depends_on:
+      - minio
+      - couchbase
+
+volumes:
+  cbdata:
+  miniodata:
