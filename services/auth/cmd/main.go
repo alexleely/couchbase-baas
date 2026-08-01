@@ -12,9 +12,9 @@ import (
 	"github.com/google/uuid"
 	"github.com/couchbase/gocb/v2"
 
-	"github.com/alexleely/couchbase-baas/services/auth/internal/crypto"
-	"github.com/alexleely/couchbase-baas/services/auth/internal/db"
-	"github.com/alexleely/couchbase-baas/services/auth/internal/models"
+	"auth/internal/crypto"
+	"auth/internal/db"
+	"auth/internal/models"
 )
 
 type HealthResponse struct {

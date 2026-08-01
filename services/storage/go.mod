@@ -1,3 +1,3 @@
-module github.com/alexleely/couchbase-baas/services/storage
+module storage
 
 go 1.22

@@ -1,3 +1,3 @@
-module github.com/alexleely/couchbase-baas/services/gateway
+module gateway
 
 go 1.22

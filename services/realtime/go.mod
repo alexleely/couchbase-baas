@@ -1,3 +1,3 @@
-module github.com/alexleely/couchbase-baas/services/realtime
+module realtime
 
 go 1.22

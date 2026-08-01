@@ -1,4 +1,4 @@
-module github.com/alexleely/couchbase-baas/services/auth
+module auth
 
 go 1.22
 

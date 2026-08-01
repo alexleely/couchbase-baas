@@ -7,7 +7,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/alexleely/couchbase-baas/services/auth/internal/models"
+	"auth/internal/models"
 )
 
 func TestSignupValidation(t *testing.T) {
