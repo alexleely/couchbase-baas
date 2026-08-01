@@ -43,7 +43,7 @@ This document provides the complete specification for all features organized as 
   - `[ ]` Write unit tests for signup handler
 
 ### US-2.2: Sign In & JWT Token Issuance
-- **Status**: `[ ]` Open
+- **Status**: `[x]` Completed
 - **User Story**: *As a developer, I want users to sign in and receive a signed JWT access token and refresh token for API authentication.*
 - **Prerequisites**: US-2.1
 - **Acceptance Criteria**:

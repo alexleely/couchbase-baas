@@ -41,3 +41,20 @@ func TestSignupValidation(t *testing.T) {
 			rr.Code, http.StatusBadRequest)
 	}
 }
+
+func TestTokenValidation(t *testing.T) {
+	// Test missing credentials
+	reqBody, _ := json.Marshal(models.SignupRequest{
+		Email:    "",
+		Password: "",
+	})
+	req, _ := http.NewRequest("POST", "/auth/v1/token", bytes.NewBuffer(reqBody))
+	rr := httptest.NewRecorder()
+
+	handleToken(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("handler returned wrong status code for empty credentials: got %v want %v",
+			rr.Code, http.StatusBadRequest)
+	}
+}

@@ -33,7 +33,7 @@ func main() {
 		port = "8001"
 	}
 
-	// Initialize Couchbase connection (retry and auto-provision scope/collection/indexes)
+	// Initialize Couchbase connection (retry and auto-provision scopes/collections/indexes)
 	if err := db.InitDB(); err != nil {
 		log.Fatalf("Fatal: Database initialization failed: %v", err)
 	}
@@ -43,6 +43,9 @@ func main() {
 
 	// User registration endpoint
 	http.HandleFunc("POST /auth/v1/signup", handleSignup)
+
+	// User login & token endpoint
+	http.HandleFunc("POST /auth/v1/token", handleToken)
 
 	log.Printf("Auth Service starting on port %s...", port)
 	if err := http.ListenAndServe(":"+port, nil); err != nil {
@@ -142,4 +145,109 @@ func handleSignup(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(userDoc)
+}
+
+func handleToken(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	var req models.SignupRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "Invalid JSON request body"})
+		return
+	}
+
+	req.Email = strings.TrimSpace(strings.ToLower(req.Email))
+	if req.Email == "" || req.Password == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "Email and password are required"})
+		return
+	}
+
+	bucketName := os.Getenv("COUCHBASE_BUCKET")
+	if bucketName == "" {
+		bucketName = "default"
+	}
+
+	// Fetch user from Couchbase using SQL++
+	queryStr := fmt.Sprintf("SELECT id, email, password_hash, role FROM `%s`.`auth`.`users` WHERE email = $1 LIMIT 1", bucketName)
+	rows, err := db.Instance.Cluster.Query(queryStr, &gocb.QueryOptions{
+		PositionalParameters: []interface{}{req.Email},
+	})
+	if err != nil {
+		log.Printf("Database query error looking up user: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "Database error looking up user"})
+		return
+	}
+	defer rows.Close()
+
+	var userDoc models.User
+	if !rows.Next() {
+		// Return 401 Unauthorized to prevent email enumeration
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "Invalid email or password"})
+		return
+	}
+
+	err = rows.Row(&userDoc)
+	if err != nil {
+		log.Printf("Failed to deserialize user row: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "Internal database deserialization error"})
+		return
+	}
+
+	// Compare password
+	match, err := crypto.ComparePassword(req.Password, userDoc.PasswordHash)
+	if err != nil || !match {
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "Invalid email or password"})
+		return
+	}
+
+	// Generate session ID and refresh token
+	sessionID := "sess_" + uuid.New().String()
+	refreshToken, err := crypto.GenerateRefreshToken()
+	if err != nil {
+		log.Printf("Failed to generate refresh token: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to generate session tokens"})
+		return
+	}
+
+	// Store Session document in Couchbase auth.sessions
+	sessionDoc := models.Session{
+		ID:           sessionID,
+		UserID:       userDoc.ID,
+		RefreshToken: refreshToken,
+		CreatedAt:    time.Now(),
+		ExpiresAt:    time.Now().Add(30 * 24 * time.Hour), // 30 days
+		Revoked:      false,
+	}
+
+	_, err = db.Instance.SessionsCollection.Insert(sessionID, sessionDoc, nil)
+	if err != nil {
+		log.Printf("Failed to insert session into database: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to save session state"})
+		return
+	}
+
+	// Generate access token JWT
+	accessToken, err := crypto.GenerateAccessToken(userDoc.ID, userDoc.Role)
+	if err != nil {
+		log.Printf("Failed to generate access token JWT: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to generate access token"})
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(models.TokenResponse{
+		AccessToken:  accessToken,
+		RefreshToken: refreshToken,
+		ExpiresIn:    3600,
+		TokenType:    "bearer",
+	})
 }
