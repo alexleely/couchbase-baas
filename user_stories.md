@@ -27,7 +27,7 @@ This document provides the complete specification for all features organized as 
 ## Epic 2: Auth Service (Identity & Access)
 
 ### US-2.1: Email & Password Registration
-- **Status**: `[ ]` Open
+- **Status**: `[x]` Completed
 - **User Story**: *As a developer, I want users to register with an email and password so their credentials are stored securely in Couchbase.*
 - **Prerequisites**: US-1.1
 - **Acceptance Criteria**:

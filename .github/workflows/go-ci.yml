@@ -1,0 +1,30 @@
+name: Go CI
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+
+jobs:
+  build:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - name: Verify Go Workspace
+        run: go work sync
+
+      - name: Run Argon2 Hashing Tests
+        run: go test -v ./services/auth/internal/crypto/...
+
+      - name: Run Auth Handler Tests
+        run: go test -v ./services/auth/cmd/...
