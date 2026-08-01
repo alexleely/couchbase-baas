@@ -59,7 +59,7 @@ This document provides the complete specification for all features organized as 
   - `[ ]` Store refresh token session in Couchbase `auth.sessions`
 
 ### US-2.3: OIDC Social Auth (Google, GitHub, Apple)
-- **Status**: `[ ]` Open
+- **Status**: `[x]` Completed
 - **User Story**: *As a frontend developer, I want users to log in using external OIDC providers via PKCE OAuth flows.*
 - **Prerequisites**: US-2.2
 - **Acceptance Criteria**:

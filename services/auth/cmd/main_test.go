@@ -32,7 +32,7 @@ func TestSignupValidation(t *testing.T) {
 		Password: "123",
 	})
 	req, _ = http.NewRequest("POST", "/auth/v1/signup", bytes.NewBuffer(reqBody))
-	rr = httptest.NewRecorder()
+	rr := httptest.NewRecorder()
 
 	handleSignup(rr, req)
 
@@ -55,6 +55,30 @@ func TestTokenValidation(t *testing.T) {
 
 	if rr.Code != http.StatusBadRequest {
 		t.Errorf("handler returned wrong status code for empty credentials: got %v want %v",
+			rr.Code, http.StatusBadRequest)
+	}
+}
+
+func TestOauthAuthorizeValidation(t *testing.T) {
+	// Test missing provider parameter
+	req, _ := http.NewRequest("GET", "/auth/v1/authorize", nil)
+	rr := httptest.NewRecorder()
+
+	handleAuthorize(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("handler returned wrong status code for missing provider: got %v want %v",
+			rr.Code, http.StatusBadRequest)
+	}
+
+	// Test invalid provider
+	req, _ = http.NewRequest("GET", "/auth/v1/authorize?provider=invalid_provider", nil)
+	rr = httptest.NewRecorder()
+
+	handleAuthorize(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("handler returned wrong status code for invalid provider: got %v want %v",
 			rr.Code, http.StatusBadRequest)
 	}
 }

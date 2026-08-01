@@ -11,17 +11,17 @@ import (
 )
 
 type DB struct {
-	Cluster            *gocb.Cluster
-	Bucket             *gocb.Bucket
-	Scope              *gocb.Scope
-	Collection         *gocb.Collection // users collection
-	SessionsCollection *gocb.Collection // sessions collection
+	Cluster               *gocb.Cluster
+	Bucket                *gocb.Bucket
+	Scope                 *gocb.Scope
+	Collection            *gocb.Collection // users collection
+	SessionsCollection    *gocb.Collection // sessions collection
+	OAuthStatesCollection *gocb.Collection // oauth_states collection
 }
 
 var Instance *DB
 
-// InitDB initializes the Couchbase connection, creates the 'auth' scope, 'users' and 'sessions' collections,
-// and required indexes programmatically.
+// InitDB initializes the Couchbase connection, creates the 'auth' scope, and all collections.
 func InitDB() error {
 	connStr := os.Getenv("COUCHBASE_CONN_STR")
 	if connStr == "" {
@@ -96,7 +96,7 @@ func InitDB() error {
 		time.Sleep(2 * time.Second)
 	}
 
-	// Create collections 'users' and 'sessions' under scope 'auth'
+	// Create collections 'users', 'sessions', and 'oauth_states' under scope 'auth'
 	scopes, err = collectionsMgr.GetAllScopes(nil)
 	if err != nil {
 		return fmt.Errorf("failed to list scopes after scope creation: %w", err)
@@ -112,6 +112,7 @@ func InitDB() error {
 
 	usersCollectionExists := false
 	sessionsCollectionExists := false
+	oauthStatesCollectionExists := false
 	if authScopeSpec != nil {
 		for _, col := range authScopeSpec.Collections {
 			if col.Name == "users" {
@@ -119,6 +120,9 @@ func InitDB() error {
 			}
 			if col.Name == "sessions" {
 				sessionsCollectionExists = true
+			}
+			if col.Name == "oauth_states" {
+				oauthStatesCollectionExists = true
 			}
 		}
 	}
@@ -149,51 +153,66 @@ func InitDB() error {
 		time.Sleep(2 * time.Second)
 	}
 
+	if !oauthStatesCollectionExists {
+		log.Println("Creating Couchbase collection 'auth.oauth_states'...")
+		colSpec := gocb.CollectionSpec{
+			Name:      "oauth_states",
+			ScopeName: "auth",
+		}
+		err = collectionsMgr.CreateCollection(colSpec, nil)
+		if err != nil && !strings.Contains(err.Error(), "already exists") {
+			return fmt.Errorf("failed to create collection 'oauth_states': %w", err)
+		}
+		time.Sleep(2 * time.Second)
+	}
+
 	scope := bucket.Scope("auth")
 	collection := scope.Collection("users")
 	sessionsCollection := scope.Collection("sessions")
+	oauthStatesCollection := scope.Collection("oauth_states")
 
 	Instance = &DB{
-		Cluster:            cluster,
-		Bucket:             bucket,
-		Scope:              scope,
-		Collection:         collection,
-		SessionsCollection: sessionsCollection,
+		Cluster:               cluster,
+		Bucket:                bucket,
+		Scope:                 scope,
+		Collection:            collection,
+		SessionsCollection:    sessionsCollection,
+		OAuthStatesCollection: oauthStatesCollection,
 	}
 
-	// Create indexes for SQL++ querying in background to avoid blocking server boot
+	// Create indexes for SQL++ querying in background
 	go func() {
 		time.Sleep(3 * time.Second)
-		log.Println("Configuring SQL++ query indexes on 'auth.users' and 'auth.sessions'...")
+		log.Println("Configuring SQL++ query indexes on 'auth' collections...")
 
-		// Users primary index
+		// Users indexes
 		_, err = cluster.Query(fmt.Sprintf("CREATE PRIMARY INDEX IF NOT EXISTS ON `%s`.`auth`.`users`", bucketName), nil)
 		if err != nil {
 			log.Printf("[Index Warning] Failed to create primary index on users: %v", err)
 		}
-
-		// Users email index
 		_, err = cluster.Query(fmt.Sprintf("CREATE INDEX IF NOT EXISTS idx_users_email ON `%s`.`auth`.`users`(email)", bucketName), nil)
 		if err != nil {
 			log.Printf("[Index Warning] Failed to create idx_users_email index: %v", err)
 		}
 
-		// Sessions primary index
+		// Sessions indexes
 		_, err = cluster.Query(fmt.Sprintf("CREATE PRIMARY INDEX IF NOT EXISTS ON `%s`.`auth`.`sessions`", bucketName), nil)
 		if err != nil {
 			log.Printf("[Index Warning] Failed to create primary index on sessions: %v", err)
 		}
-
-		// Sessions user_id index
 		_, err = cluster.Query(fmt.Sprintf("CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON `%s`.`auth`.`sessions`(user_id)", bucketName), nil)
 		if err != nil {
 			log.Printf("[Index Warning] Failed to create idx_sessions_user_id index: %v", err)
 		}
-
-		// Sessions refresh_token index
 		_, err = cluster.Query(fmt.Sprintf("CREATE INDEX IF NOT EXISTS idx_sessions_refresh_token ON `%s`.`auth`.`sessions`(refresh_token)", bucketName), nil)
 		if err != nil {
 			log.Printf("[Index Warning] Failed to create idx_sessions_refresh_token index: %v", err)
+		}
+
+		// OAuth States indexes
+		_, err = cluster.Query(fmt.Sprintf("CREATE PRIMARY INDEX IF NOT EXISTS ON `%s`.`auth`.`oauth_states`", bucketName), nil)
+		if err != nil {
+			log.Printf("[Index Warning] Failed to create primary index on oauth_states: %v", err)
 		}
 
 		log.Println("Indexes configured successfully.")

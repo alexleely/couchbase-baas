@@ -7,4 +7,5 @@ require (
 	github.com/google/uuid v1.6.0
 	golang.org/x/crypto v0.25.0
 	github.com/golang-jwt/jwt/v5 v5.2.1
+	golang.org/x/oauth2 v0.21.0
 )
