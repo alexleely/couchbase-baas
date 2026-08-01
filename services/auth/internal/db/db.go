@@ -17,6 +17,7 @@ type DB struct {
 	Collection            *gocb.Collection // users collection
 	SessionsCollection    *gocb.Collection // sessions collection
 	OAuthStatesCollection *gocb.Collection // oauth_states collection
+	SAMLProvidersCollection *gocb.Collection // saml_providers collection
 }
 
 var Instance *DB
@@ -96,7 +97,7 @@ func InitDB() error {
 		time.Sleep(2 * time.Second)
 	}
 
-	// Create collections 'users', 'sessions', and 'oauth_states' under scope 'auth'
+	// Create collections 'users', 'sessions', 'oauth_states', and 'saml_providers' under scope 'auth'
 	scopes, err = collectionsMgr.GetAllScopes(nil)
 	if err != nil {
 		return fmt.Errorf("failed to list scopes after scope creation: %w", err)
@@ -113,6 +114,7 @@ func InitDB() error {
 	usersCollectionExists := false
 	sessionsCollectionExists := false
 	oauthStatesCollectionExists := false
+	samlProvidersCollectionExists := false
 	if authScopeSpec != nil {
 		for _, col := range authScopeSpec.Collections {
 			if col.Name == "users" {
@@ -123,6 +125,9 @@ func InitDB() error {
 			}
 			if col.Name == "oauth_states" {
 				oauthStatesCollectionExists = true
+			}
+			if col.Name == "saml_providers" {
+				samlProvidersCollectionExists = true
 			}
 		}
 	}
@@ -166,18 +171,33 @@ func InitDB() error {
 		time.Sleep(2 * time.Second)
 	}
 
+	if !samlProvidersCollectionExists {
+		log.Println("Creating Couchbase collection 'auth.saml_providers'...")
+		colSpec := gocb.CollectionSpec{
+			Name:      "saml_providers",
+			ScopeName: "auth",
+		}
+		err = collectionsMgr.CreateCollection(colSpec, nil)
+		if err != nil && !strings.Contains(err.Error(), "already exists") {
+			return fmt.Errorf("failed to create collection 'saml_providers': %w", err)
+		}
+		time.Sleep(2 * time.Second)
+	}
+
 	scope := bucket.Scope("auth")
 	collection := scope.Collection("users")
 	sessionsCollection := scope.Collection("sessions")
 	oauthStatesCollection := scope.Collection("oauth_states")
+	samlProvidersCollection := scope.Collection("saml_providers")
 
 	Instance = &DB{
-		Cluster:               cluster,
-		Bucket:                bucket,
-		Scope:                 scope,
-		Collection:            collection,
-		SessionsCollection:    sessionsCollection,
-		OAuthStatesCollection: oauthStatesCollection,
+		Cluster:                 cluster,
+		Bucket:                  bucket,
+		Scope:                   scope,
+		Collection:              collection,
+		SessionsCollection:      sessionsCollection,
+		OAuthStatesCollection:   oauthStatesCollection,
+		SAMLProvidersCollection: samlProvidersCollection,
 	}
 
 	// Create indexes for SQL++ querying in background
@@ -213,6 +233,12 @@ func InitDB() error {
 		_, err = cluster.Query(fmt.Sprintf("CREATE PRIMARY INDEX IF NOT EXISTS ON `%s`.`auth`.`oauth_states`", bucketName), nil)
 		if err != nil {
 			log.Printf("[Index Warning] Failed to create primary index on oauth_states: %v", err)
+		}
+
+		// SAML Providers indexes
+		_, err = cluster.Query(fmt.Sprintf("CREATE PRIMARY INDEX IF NOT EXISTS ON `%s`.`auth`.`saml_providers`", bucketName), nil)
+		if err != nil {
+			log.Printf("[Index Warning] Failed to create primary index on saml_providers: %v", err)
 		}
 
 		log.Println("Indexes configured successfully.")

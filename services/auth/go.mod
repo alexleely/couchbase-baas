@@ -8,4 +8,5 @@ require (
 	golang.org/x/crypto v0.25.0
 	github.com/golang-jwt/jwt/v5 v5.2.1
 	golang.org/x/oauth2 v0.21.0
+	github.com/crewjam/saml v0.4.14
 )

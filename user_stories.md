@@ -73,7 +73,7 @@ This document provides the complete specification for all features organized as 
   - `[ ]` Implement callback endpoint `/auth/v1/callback`
 
 ### US-2.4: SAML 2.0 Enterprise Single Sign-On (SSO)
-- **Status**: `[ ]` Open
+- **Status**: `[x]` Completed
 - **User Story**: *As an enterprise admin, I want my employees to log in via our corporate SAML Identity Provider (Okta, Azure AD).*
 - **Prerequisites**: US-2.2
 - **Acceptance Criteria**:

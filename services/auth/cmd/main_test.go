@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"auth/internal/models"
@@ -80,5 +81,26 @@ func TestOauthAuthorizeValidation(t *testing.T) {
 	if rr.Code != http.StatusBadRequest {
 		t.Errorf("handler returned wrong status code for invalid provider: got %v want %v",
 			rr.Code, http.StatusBadRequest)
+	}
+}
+
+func TestSAMLMetadataGeneration(t *testing.T) {
+	req, _ := http.NewRequest("GET", "/auth/v1/saml/metadata", nil)
+	rr := httptest.NewRecorder()
+
+	handleSAMLMetadata(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status code 200, got: %d", rr.Code)
+	}
+
+	contentType := rr.Header().Get("Content-Type")
+	if contentType != "application/xml" {
+		t.Errorf("expected Content-Type application/xml, got: %s", contentType)
+	}
+
+	xmlBody := rr.Body.String()
+	if !strings.Contains(xmlBody, "EntityDescriptor") {
+		t.Errorf("expected SAML Metadata XML to contain EntityDescriptor tag, got:\n%s", xmlBody)
 	}
 }

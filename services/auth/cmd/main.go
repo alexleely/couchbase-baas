@@ -1,11 +1,20 @@
 package main
 
 import (
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"log"
+	"math/big"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -13,6 +22,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/couchbase/gocb/v2"
 	"golang.org/x/oauth2"
+	"github.com/crewjam/saml"
 
 	"auth/internal/crypto"
 	"auth/internal/db"
@@ -27,6 +37,45 @@ type HealthResponse struct {
 
 type ErrorResponse struct {
 	Error string `json:"error"`
+}
+
+// Global Service Provider Certificate variables
+var (
+	spPrivateKey  *rsa.PrivateKey
+	spCertificate *x509.Certificate
+)
+
+func init() {
+	// Dynamically generate a self-signed keypair for SAML Service Provider on launch
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		log.Fatalf("Failed to generate dynamic SAML keypair: %v", err)
+	}
+	spPrivateKey = priv
+
+	template := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			CommonName:   "Couchbase-BaaS-SP",
+			Organization: []string{"Couchbase Developer Platform"},
+		},
+		NotBefore:             time.Now().Add(-1 * time.Hour),
+		NotAfter:              time.Now().Add(365 * 24 * time.Hour),
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+	}
+
+	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
+	if err != nil {
+		log.Fatalf("Failed to create dynamic SAML SP certificate: %v", err)
+	}
+
+	cert, err := x509.ParseCertificate(derBytes)
+	if err != nil {
+		log.Fatalf("Failed to parse dynamic SAML SP certificate: %v", err)
+	}
+	spCertificate = cert
 }
 
 func main() {
@@ -50,6 +99,11 @@ func main() {
 	// OIDC Social Login endpoints
 	http.HandleFunc("GET /auth/v1/authorize", handleAuthorize)
 	http.HandleFunc("GET /auth/v1/callback", handleCallback)
+
+	// SAML SSO endpoints
+	http.HandleFunc("GET /auth/v1/saml/metadata", handleSAMLMetadata)
+	http.HandleFunc("GET /auth/v1/saml/authorize", handleSAMLAuthorize)
+	http.HandleFunc("POST /auth/v1/saml/acs", handleSAMLACS)
 
 	log.Printf("Auth Service starting on port %s...", port)
 	if err := http.ListenAndServe(":"+port, nil); err != nil {
@@ -266,7 +320,6 @@ func handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Cache verifier and state in Couchbase auth.oauth_states (TTL 5 mins)
 	stateDoc := models.OAuthState{
 		State:        state,
 		Provider:     provider,
@@ -304,7 +357,6 @@ func handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Retrieve PKCE details from state mapping
 	var stateDoc models.OAuthState
 	err := db.Instance.OAuthStatesCollection.Get(state, nil).Content(&stateDoc)
 	if err != nil {
@@ -321,7 +373,6 @@ func handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Exchange Authorization Code for Token (inject verifier)
 	token, err := cfg.Exchange(r.Context(), code, oauth2.SetAuthURLParam("code_verifier", stateDoc.CodeVerifier))
 	if err != nil {
 		log.Printf("OIDC token exchange failed: %v", err)
@@ -330,7 +381,6 @@ func handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Fetch Profile from Provider UserInfo endpoints
 	email, err := fetchOIDCProfileEmail(stateDoc.Provider, token.AccessToken)
 	if err != nil {
 		log.Printf("Failed to fetch provider user profile: %v", err)
@@ -344,7 +394,6 @@ func handleCallback(w http.ResponseWriter, r *http.Request) {
 		bucketName = "default"
 	}
 
-	// Check if user already exists
 	queryStr := fmt.Sprintf("SELECT id, email, role FROM `%s`.`auth`.`users` WHERE email = $1 LIMIT 1", bucketName)
 	rows, err := db.Instance.Cluster.Query(queryStr, &gocb.QueryOptions{
 		PositionalParameters: []interface{}{email},
@@ -368,12 +417,11 @@ func handleCallback(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	} else {
-		// Register a new user automatically
 		userID := "usr_" + uuid.New().String()
 		userDoc = models.User{
 			ID:           userID,
 			Email:        email,
-			PasswordHash: "", // OIDC users have no password hash
+			PasswordHash: "",
 			CreatedAt:    time.Now(),
 			UpdatedAt:    time.Now(),
 			Role:         "authenticated",
@@ -386,7 +434,6 @@ func handleCallback(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Create platform session
 	_, refreshToken, err := createSession(userDoc.ID)
 	if err != nil {
 		log.Printf("Failed to create SSO session: %v", err)
@@ -406,9 +453,310 @@ func handleCallback(w http.ResponseWriter, r *http.Request) {
 		clientRedirect = "http://localhost:3000/callback"
 	}
 
-	// Redirect to Client application with final credentials in the URL fragment
 	finalURL := fmt.Sprintf("%s#access_token=%s&refresh_token=%s&expires_in=3600&token_type=bearer", clientRedirect, accessToken, refreshToken)
 	http.Redirect(w, r, finalURL, http.StatusTemporaryRedirect)
+}
+
+// SAML SP Metadata endpoint
+func handleSAMLMetadata(w http.ResponseWriter, r *http.Request) {
+	spURL := getBaseSPURL()
+	sp := saml.ServiceProvider{
+		EntityID:    spURL + "/auth/v1/saml/metadata",
+		Key:         spPrivateKey,
+		Certificate: spCertificate,
+		AcsURL:      spURL + "/auth/v1/saml/acs",
+		MetadataURL: spURL + "/auth/v1/saml/metadata",
+	}
+
+	metadata, err := sp.MetadataWithConfig(nil)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to generate SP metadata"})
+		return
+	}
+
+	xmlBytes, err := xml.MarshalIndent(metadata, "", "  ")
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to marshal SP metadata XML"})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/xml")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(xml.Header))
+	w.Write(xmlBytes)
+}
+
+// SAML SSO Redirection endpoint
+func handleSAMLAuthorize(w http.ResponseWriter, r *http.Request) {
+	domain := r.URL.Query().Get("domain")
+	if domain == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "Domain query parameter is required"})
+		return
+	}
+
+	// Fetch SAML provider details from Couchbase
+	var provider models.SAMLProvider
+	err := db.Instance.SAMLProvidersCollection.Get(domain, nil).Content(&provider)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "Unsupported enterprise domain or SSO not configured"})
+		return
+	}
+
+	idpCertBytes, err := decodeBase64Cert(provider.IdPPublicCert)
+	if err != nil {
+		log.Printf("Invalid IdP X.509 Certificate in DB: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "Invalid SSO identity provider configuration"})
+		return
+	}
+
+	// Create dynamic ServiceProvider instance linked to this IdP
+	spURL := getBaseSPURL()
+	sp := saml.ServiceProvider{
+		EntityID:    spURL + "/auth/v1/saml/metadata",
+		Key:         spPrivateKey,
+		Certificate: spCertificate,
+		AcsURL:      spURL + "/auth/v1/saml/acs",
+		MetadataURL: spURL + "/auth/v1/saml/metadata",
+		IDPMetadata: &saml.EntityDescriptor{
+			EntityID: provider.IdPEntityID,
+			IDPSSODescriptors: []saml.IDPSSODescriptor{
+				{
+					SSOLocations: []saml.Endpoint{
+						{
+							Binding:  saml.HTTPRedirectBinding,
+							Location: provider.IdPSSOURL,
+						},
+					},
+					KeyDescriptors: []saml.KeyDescriptor{
+						{
+							Use: "signing",
+							KeyInfo: saml.KeyInfo{
+								X509Data: saml.X509Data{
+									X509Certificates: []saml.X509Certificate{
+										{Data: base64.StdEncoding.EncodeToString(idpCertBytes)},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	// Generate AuthnRequest
+	req, err := sp.MakeAuthenticationRequest(provider.IdPSSOURL, saml.HTTPRedirectBinding, saml.HTTPPostBinding)
+	if err != nil {
+		log.Printf("Failed to create SAML AuthnRequest: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	// RelayState contains domain for document lookup at callback
+	redirectURL, err := req.Redirect(domain, &sp)
+	if err != nil {
+		log.Printf("Failed to generate SAML redirect URL: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	http.Redirect(w, r, redirectURL.String(), http.StatusTemporaryRedirect)
+}
+
+// SAML ACS Callback endpoint (HTTP-POST)
+func handleSAMLACS(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "Invalid form payload"})
+		return
+	}
+
+	samlResponse := r.FormValue("SAMLResponse")
+	domain := r.FormValue("RelayState")
+
+	if samlResponse == "" || domain == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "Missing SAMLResponse or RelayState"})
+		return
+	}
+
+	// Fetch SAML provider from Couchbase
+	var provider models.SAMLProvider
+	err := db.Instance.SAMLProvidersCollection.Get(domain, nil).Content(&provider)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "SAML SSO session expired or domain unsupported"})
+		return
+	}
+
+	idpCertBytes, err := decodeBase64Cert(provider.IdPPublicCert)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	spURL := getBaseSPURL()
+	sp := saml.ServiceProvider{
+		EntityID:    spURL + "/auth/v1/saml/metadata",
+		Key:         spPrivateKey,
+		Certificate: spCertificate,
+		AcsURL:      spURL + "/auth/v1/saml/acs",
+		MetadataURL: spURL + "/auth/v1/saml/metadata",
+		IDPMetadata: &saml.EntityDescriptor{
+			EntityID: provider.IdPEntityID,
+			IDPSSODescriptors: []saml.IDPSSODescriptor{
+				{
+					SSOLocations: []saml.Endpoint{
+						{
+							Binding:  saml.HTTPRedirectBinding,
+							Location: provider.IdPSSOURL,
+						},
+					},
+					KeyDescriptors: []saml.KeyDescriptor{
+						{
+							Use: "signing",
+							KeyInfo: saml.KeyInfo{
+								X509Data: saml.X509Data{
+									X509Certificates: []saml.X509Certificate{
+										{Data: base64.StdEncoding.EncodeToString(idpCertBytes)},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	// Validate SAML assertion signature and constraints
+	assertion, err := sp.ParseAndValidateAssertion(samlResponse, []string{})
+	if err != nil {
+		log.Printf("SAML Assertion Validation failure: %v", err)
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "SAML signature validation failed or token expired"})
+		return
+	}
+
+	// Extract corporate email attribute
+	email := ""
+	for _, attrStatement := range assertion.AttributeStatements {
+		for _, attr := range attrStatement.Attributes {
+			// Look for standard email attributes (Okta/Azure AD typical naming formats)
+			name := strings.ToLower(attr.Name)
+			if name == "email" || name == "mail" || strings.HasSuffix(name, "emailaddress") {
+				if len(attr.AttributeValues) > 0 {
+					email = attr.AttributeValues[0].Value
+					break
+				}
+			}
+		}
+	}
+
+	// Fallback to NameID if email attributes are missing
+	if email == "" && assertion.Subject != nil && assertion.Subject.NameID != nil {
+		email = assertion.Subject.NameID.Value
+	}
+
+	email = strings.TrimSpace(strings.ToLower(email))
+	if email == "" || !strings.Contains(email, "@") {
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "Corporate email attribute missing in SAML assertion"})
+		return
+	}
+
+	bucketName := os.Getenv("COUCHBASE_BUCKET")
+	if bucketName == "" {
+		bucketName = "default"
+	}
+
+	// Map corporate profile to system User
+	queryStr := fmt.Sprintf("SELECT id, email, role FROM `%s`.`auth`.`users` WHERE email = $1 LIMIT 1", bucketName)
+	rows, err := db.Instance.Cluster.Query(queryStr, &gocb.QueryOptions{
+		PositionalParameters: []interface{}{email},
+	})
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	var userDoc models.User
+	userExists := rows.Next()
+
+	if userExists {
+		err = rows.Row(&userDoc)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+	} else {
+		userID := "usr_" + uuid.New().String()
+		userDoc = models.User{
+			ID:           userID,
+			Email:        email,
+			PasswordHash: "",
+			CreatedAt:    time.Now(),
+			UpdatedAt:    time.Now(),
+			Role:         "authenticated",
+		}
+		_, err = db.Instance.Collection.Insert(userID, userDoc, nil)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+	}
+
+	// Issue credentials
+	_, refreshToken, err := createSession(userDoc.ID)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	accessToken, err := crypto.GenerateAccessToken(userDoc.ID, userDoc.Role)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	clientRedirect := os.Getenv("CLIENT_REDIRECT_URL")
+	if clientRedirect == "" {
+		clientRedirect = "http://localhost:3000/callback"
+	}
+
+	finalURL := fmt.Sprintf("%s#access_token=%s&refresh_token=%s&expires_in=3600&token_type=bearer", clientRedirect, accessToken, refreshToken)
+	http.Redirect(w, r, finalURL, http.StatusTemporaryRedirect)
+}
+
+// Helpers: SAML URL Resolvers
+func getBaseSPURL() string {
+	redirectURLBase := os.Getenv("REDIRECT_URL_BASE")
+	if redirectURLBase == "" {
+		redirectURLBase = "http://localhost:8001"
+	}
+	return redirectURLBase
+}
+
+// Helper: Decode PEM/DER Public X.509 Certificates
+func decodeBase64Cert(certData string) ([]byte, error) {
+	// If PEM block format, decode PEM first
+	if strings.Contains(certData, "-----BEGIN CERTIFICATE-----") {
+		block, _ := pem.Decode([]byte(certData))
+		if block == nil {
+			return nil, fmt.Errorf("invalid PEM block")
+		}
+		return block.Bytes, nil
+	}
+	
+	// Strip whitespace and decode raw base64
+	clean := strings.Join(strings.Fields(certData), "")
+	return base64.StdEncoding.DecodeToString(clean)
 }
 
 // Helper: Setup Standard OAuth2 configurations dynamically
@@ -482,7 +830,6 @@ func fetchOIDCProfileEmail(provider string, accessToken string) (string, error) 
 		return "", err
 	}
 
-	// Dynamic JSON extraction
 	var profileMap map[string]interface{}
 	if err := json.Unmarshal(body, &profileMap); err != nil {
 		return "", err
@@ -493,11 +840,9 @@ func fetchOIDCProfileEmail(provider string, accessToken string) (string, error) 
 			return email, nil
 		}
 	} else if provider == "github" {
-		// GitHub might return email null if private, but standard profiles return it if public
 		if email, ok := profileMap["email"].(string); ok && email != "" {
 			return email, nil
 		}
-		// Fallback for private github email addresses: query user/emails API
 		return fetchGitHubPrivateEmail(accessToken)
 	}
 
