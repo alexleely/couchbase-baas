@@ -104,8 +104,8 @@ This document provides the complete specification for all features organized as 
 
 ## Epic 3: Data API Service (REST & SQL++)
 
-### US-3.1: Automatic REST Endpoint Generation
-- **Status**: `[ ]` Open
+### US-3.1: REST API Gateway for Couchbase CRUD Operations
+- **Status**: `[x]` Completed
 - **User Story**: *As a developer, I want automatic REST CRUD endpoints generated for Couchbase collections without writing custom controllers.*
 - **Prerequisites**: US-1.1
 - **Acceptance Criteria**:
