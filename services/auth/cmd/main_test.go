@@ -45,9 +45,10 @@ func TestSignupValidation(t *testing.T) {
 
 func TestTokenValidation(t *testing.T) {
 	// Test missing credentials
-	reqBody, _ := json.Marshal(models.SignupRequest{
-		Email:    "",
-		Password: "",
+	reqBody, _ := json.Marshal(models.TokenRequest{
+		GrantType: "password",
+		Email:     "",
+		Password:  "",
 	})
 	req, _ := http.NewRequest("POST", "/auth/v1/token", bytes.NewBuffer(reqBody))
 	rr := httptest.NewRecorder()
@@ -102,5 +103,33 @@ func TestSAMLMetadataGeneration(t *testing.T) {
 	xmlBody := rr.Body.String()
 	if !strings.Contains(xmlBody, "EntityDescriptor") {
 		t.Errorf("expected SAML Metadata XML to contain EntityDescriptor tag, got:\n%s", xmlBody)
+	}
+}
+
+func TestTokenRefreshValidation(t *testing.T) {
+	// Test refresh token request with missing refresh token string
+	reqBody, _ := json.Marshal(models.TokenRequest{
+		GrantType:    "refresh_token",
+		RefreshToken: "",
+	})
+	req, _ := http.NewRequest("POST", "/auth/v1/token", bytes.NewBuffer(reqBody))
+	rr := httptest.NewRecorder()
+
+	handleToken(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("expected status code 400 for empty refresh token request, got: %d", rr.Code)
+	}
+}
+
+func TestLogoutValidation(t *testing.T) {
+	// Test logout without Authorization Bearer header
+	req, _ := http.NewRequest("POST", "/auth/v1/logout", nil)
+	rr := httptest.NewRecorder()
+
+	handleLogout(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("expected status code 401 for unauthorized logout, got: %d", rr.Code)
 	}
 }

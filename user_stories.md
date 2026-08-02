@@ -88,7 +88,7 @@ This document provides the complete specification for all features organized as 
   - `[ ]` Implement `/auth/v1/saml/acs` assertion consumer handler
 
 ### US-2.5: Token Refresh & Session Invalidation
-- **Status**: `[ ]` Open
+- **Status**: `[x]` Completed
 - **User Story**: *As an app user, I want to refresh my access token without logging in again, and log out securely.*
 - **Prerequisites**: US-2.2
 - **Acceptance Criteria**:

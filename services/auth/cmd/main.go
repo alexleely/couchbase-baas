@@ -29,6 +29,7 @@ import (
 	"auth/internal/models"
 )
 
+
 type HealthResponse struct {
 	Service string `json:"service"`
 	Status  string `json:"status"`
@@ -95,6 +96,7 @@ func main() {
 	// User registration & login endpoints
 	http.HandleFunc("POST /auth/v1/signup", handleSignup)
 	http.HandleFunc("POST /auth/v1/token", handleToken)
+	http.HandleFunc("POST /auth/v1/logout", handleLogout)
 
 	// OIDC Social Login endpoints
 	http.HandleFunc("GET /auth/v1/authorize", handleAuthorize)
@@ -208,17 +210,223 @@ func handleSignup(w http.ResponseWriter, r *http.Request) {
 func handleToken(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
-	var req models.SignupRequest
+	var req models.TokenRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(ErrorResponse{Error: "Invalid JSON request body"})
 		return
 	}
 
-	req.Email = strings.TrimSpace(strings.ToLower(req.Email))
-	if req.Email == "" || req.Password == "" {
+	// Default to password grant if not provided
+	if req.GrantType == "" {
+		req.GrantType = "password"
+	}
+
+	bucketName := os.Getenv("COUCHBASE_BUCKET")
+	if bucketName == "" {
+		bucketName = "default"
+	}
+
+	if req.GrantType == "password" {
+		req.Email = strings.TrimSpace(strings.ToLower(req.Email))
+		if req.Email == "" || req.Password == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Email and password are required"})
+			return
+		}
+
+		// Fetch user from Couchbase using SQL++
+		queryStr := fmt.Sprintf("SELECT id, email, password_hash, role FROM `%s`.`auth`.`users` WHERE email = $1 LIMIT 1", bucketName)
+		rows, err := db.Instance.Cluster.Query(queryStr, &gocb.QueryOptions{
+			PositionalParameters: []interface{}{req.Email},
+		})
+		if err != nil {
+			log.Printf("Database query error looking up user: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Database error looking up user"})
+			return
+		}
+		defer rows.Close()
+
+		var userDoc models.User
+		if !rows.Next() {
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Invalid email or password"})
+			return
+		}
+
+		err = rows.Row(&userDoc)
+		if err != nil {
+			log.Printf("Failed to deserialize user row: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		// Compare password
+		match, err := crypto.ComparePassword(req.Password, userDoc.PasswordHash)
+		if err != nil || !match {
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Invalid email or password"})
+			return
+		}
+
+		// Generate session
+		_, refreshToken, err := createSession(userDoc.ID)
+		if err != nil {
+			log.Printf("Failed to create session: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		// Generate access token JWT
+		accessToken, err := crypto.GenerateAccessToken(userDoc.ID, userDoc.Role)
+		if err != nil {
+			log.Printf("Failed to generate access token JWT: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(models.TokenResponse{
+			AccessToken:  accessToken,
+			RefreshToken: refreshToken,
+			ExpiresIn:    3600,
+			TokenType:    "bearer",
+		})
+		return
+
+	} else if req.GrantType == "refresh_token" {
+		if req.RefreshToken == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "refresh_token is required"})
+			return
+		}
+
+		// Lookup active session matching the refresh token
+		queryStr := fmt.Sprintf("SELECT id, user_id, refresh_token, expires_at, revoked FROM `%s`.`auth`.`sessions` WHERE refresh_token = $1 LIMIT 1", bucketName)
+		rows, err := db.Instance.Cluster.Query(queryStr, &gocb.QueryOptions{
+			PositionalParameters: []interface{}{req.RefreshToken},
+		})
+		if err != nil {
+			log.Printf("Database query error looking up session: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		defer rows.Close()
+
+		var sessionDoc models.Session
+		if !rows.Next() {
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Invalid or expired refresh token"})
+			return
+		}
+
+		err = rows.Row(&sessionDoc)
+		if err != nil {
+			log.Printf("Failed to deserialize session row: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		// Validate expiration and revocation
+		if sessionDoc.Revoked || time.Now().After(sessionDoc.ExpiresAt) {
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Invalid or expired refresh token"})
+			return
+		}
+
+		// Fetch the user's role from user document
+		queryUser := fmt.Sprintf("SELECT role FROM `%s`.`auth`.`users` WHERE id = $1 LIMIT 1", bucketName)
+		userRows, err := db.Instance.Cluster.Query(queryUser, &gocb.QueryOptions{
+			PositionalParameters: []interface{}{sessionDoc.UserID},
+		})
+		if err != nil {
+			log.Printf("Database query error looking up user role: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		defer userRows.Close()
+
+		userRole := "authenticated"
+		var userMap map[string]interface{}
+		if userRows.Next() {
+			if err := userRows.Row(&userMap); err == nil {
+				if r, ok := userMap["role"].(string); ok {
+					userRole = r
+				}
+			}
+		}
+
+		// Rotate the refresh token
+		newRefreshToken, err := crypto.GenerateRefreshToken()
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		sessionDoc.RefreshToken = newRefreshToken
+		sessionDoc.ExpiresAt = time.Now().Add(30 * 24 * time.Hour) // Extend session 30 days
+
+		// Update session doc in Couchbase
+		_, err = db.Instance.SessionsCollection.Replace(sessionDoc.ID, sessionDoc, nil)
+		if err != nil {
+			log.Printf("Database error replacing session: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		// Generate new access token JWT
+		accessToken, err := crypto.GenerateAccessToken(sessionDoc.UserID, userRole)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(models.TokenResponse{
+			AccessToken:  accessToken,
+			RefreshToken: newRefreshToken,
+			ExpiresIn:    3600,
+			TokenType:    "bearer",
+		})
+		return
+	}
+
+	w.WriteHeader(http.StatusBadRequest)
+	json.NewEncoder(w).Encode(ErrorResponse{Error: "Unsupported grant_type"})
+}
+
+// Invalidate Session (Logout)
+func handleLogout(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	// Parse Authorization Header: Bearer <JWT>
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "Bearer authentication token is required"})
+		return
+	}
+	tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
+
+	// Validate access token
+	claims, err := crypto.ValidateAccessToken(tokenStr)
+	if err != nil {
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "Invalid or expired access token"})
+		return
+	}
+
+	var req models.LogoutRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(ErrorResponse{Error: "Email and password are required"})
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "Invalid JSON request body"})
+		return
+	}
+
+	if req.RefreshToken == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "refresh_token is required to invalidate the session"})
 		return
 	}
 
@@ -227,67 +435,48 @@ func handleToken(w http.ResponseWriter, r *http.Request) {
 		bucketName = "default"
 	}
 
-	// Fetch user from Couchbase using SQL++
-	queryStr := fmt.Sprintf("SELECT id, email, password_hash, role FROM `%s`.`auth`.`users` WHERE email = $1 LIMIT 1", bucketName)
+	// Lookup session matching refresh token
+	queryStr := fmt.Sprintf("SELECT id, user_id, refresh_token, expires_at, revoked FROM `%s`.`auth`.`sessions` WHERE refresh_token = $1 LIMIT 1", bucketName)
 	rows, err := db.Instance.Cluster.Query(queryStr, &gocb.QueryOptions{
-		PositionalParameters: []interface{}{req.Email},
+		PositionalParameters: []interface{}{req.RefreshToken},
 	})
 	if err != nil {
-		log.Printf("Database query error looking up user: %v", err)
+		log.Printf("Database query error looking up session for logout: %v", err)
 		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(ErrorResponse{Error: "Database error looking up user"})
 		return
 	}
 	defer rows.Close()
 
-	var userDoc models.User
+	var sessionDoc models.Session
 	if !rows.Next() {
 		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(ErrorResponse{Error: "Invalid email or password"})
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "Session not found"})
 		return
 	}
 
-	err = rows.Row(&userDoc)
+	err = rows.Row(&sessionDoc)
 	if err != nil {
-		log.Printf("Failed to deserialize user row: %v", err)
 		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(ErrorResponse{Error: "Internal database deserialization error"})
 		return
 	}
 
-	// Compare password
-	match, err := crypto.ComparePassword(req.Password, userDoc.PasswordHash)
-	if err != nil || !match {
-		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(ErrorResponse{Error: "Invalid email or password"})
+	// Security Check: Verify session owner matches JWT subject
+	if sessionDoc.UserID != claims.Subject {
+		w.WriteHeader(http.StatusForbidden)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "Access denied: cannot revoke another user's session"})
 		return
 	}
 
-	// Generate session
-	sessionID, refreshToken, err := createSession(userDoc.ID)
+	// Mark session as revoked in Couchbase
+	sessionDoc.Revoked = true
+	_, err = db.Instance.SessionsCollection.Replace(sessionDoc.ID, sessionDoc, nil)
 	if err != nil {
-		log.Printf("Failed to create session: %v", err)
+		log.Printf("Database replace error revoking session: %v", err)
 		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to generate session tokens"})
 		return
 	}
 
-	// Generate access token JWT
-	accessToken, err := crypto.GenerateAccessToken(userDoc.ID, userDoc.Role)
-	if err != nil {
-		log.Printf("Failed to generate access token JWT: %v", err)
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to generate access token"})
-		return
-	}
-
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(models.TokenResponse{
-		AccessToken:  accessToken,
-		RefreshToken: refreshToken,
-		ExpiresIn:    3600,
-		TokenType:    "bearer",
-	})
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // OIDC Authorize Request
@@ -497,7 +686,6 @@ func handleSAMLAuthorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Fetch SAML provider details from Couchbase
 	var provider models.SAMLProvider
 	err := db.Instance.SAMLProvidersCollection.Get(domain, nil).Content(&provider)
 	if err != nil {
@@ -514,7 +702,6 @@ func handleSAMLAuthorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Create dynamic ServiceProvider instance linked to this IdP
 	spURL := getBaseSPURL()
 	sp := saml.ServiceProvider{
 		EntityID:    spURL + "/auth/v1/saml/metadata",
@@ -549,7 +736,6 @@ func handleSAMLAuthorize(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
-	// Generate AuthnRequest
 	req, err := sp.MakeAuthenticationRequest(provider.IdPSSOURL, saml.HTTPRedirectBinding, saml.HTTPPostBinding)
 	if err != nil {
 		log.Printf("Failed to create SAML AuthnRequest: %v", err)
@@ -557,7 +743,6 @@ func handleSAMLAuthorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// RelayState contains domain for document lookup at callback
 	redirectURL, err := req.Redirect(domain, &sp)
 	if err != nil {
 		log.Printf("Failed to generate SAML redirect URL: %v", err)
@@ -585,7 +770,6 @@ func handleSAMLACS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Fetch SAML provider from Couchbase
 	var provider models.SAMLProvider
 	err := db.Instance.SAMLProvidersCollection.Get(domain, nil).Content(&provider)
 	if err != nil {
@@ -634,7 +818,6 @@ func handleSAMLACS(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
-	// Validate SAML assertion signature and constraints
 	assertion, err := sp.ParseAndValidateAssertion(samlResponse, []string{})
 	if err != nil {
 		log.Printf("SAML Assertion Validation failure: %v", err)
@@ -643,11 +826,9 @@ func handleSAMLACS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Extract corporate email attribute
 	email := ""
 	for _, attrStatement := range assertion.AttributeStatements {
 		for _, attr := range attrStatement.Attributes {
-			// Look for standard email attributes (Okta/Azure AD typical naming formats)
 			name := strings.ToLower(attr.Name)
 			if name == "email" || name == "mail" || strings.HasSuffix(name, "emailaddress") {
 				if len(attr.AttributeValues) > 0 {
@@ -658,7 +839,6 @@ func handleSAMLACS(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Fallback to NameID if email attributes are missing
 	if email == "" && assertion.Subject != nil && assertion.Subject.NameID != nil {
 		email = assertion.Subject.NameID.Value
 	}
@@ -675,7 +855,6 @@ func handleSAMLACS(w http.ResponseWriter, r *http.Request) {
 		bucketName = "default"
 	}
 
-	// Map corporate profile to system User
 	queryStr := fmt.Sprintf("SELECT id, email, role FROM `%s`.`auth`.`users` WHERE email = $1 LIMIT 1", bucketName)
 	rows, err := db.Instance.Cluster.Query(queryStr, &gocb.QueryOptions{
 		PositionalParameters: []interface{}{email},
@@ -712,7 +891,6 @@ func handleSAMLACS(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Issue credentials
 	_, refreshToken, err := createSession(userDoc.ID)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -745,7 +923,6 @@ func getBaseSPURL() string {
 
 // Helper: Decode PEM/DER Public X.509 Certificates
 func decodeBase64Cert(certData string) ([]byte, error) {
-	// If PEM block format, decode PEM first
 	if strings.Contains(certData, "-----BEGIN CERTIFICATE-----") {
 		block, _ := pem.Decode([]byte(certData))
 		if block == nil {
@@ -754,7 +931,6 @@ func decodeBase64Cert(certData string) ([]byte, error) {
 		return block.Bytes, nil
 	}
 	
-	// Strip whitespace and decode raw base64
 	clean := strings.Join(strings.Fields(certData), "")
 	return base64.StdEncoding.DecodeToString(clean)
 }
