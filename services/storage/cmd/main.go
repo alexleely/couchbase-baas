@@ -15,6 +15,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 
 	storageDB "storage/internal/db"
+	"storage/internal/models"
 	storageS3 "storage/internal/s3"
 )
 
@@ -36,6 +37,12 @@ type CRUDResponse struct {
 
 type CustomClaims struct {
 	Role string `json:"role"`
+	jwt.RegisteredClaims
+}
+
+type SignedURLClaims struct {
+	Bucket   string `json:"bucket"`
+	Filename string `json:"filename"`
 	jwt.RegisteredClaims
 }
 
@@ -73,6 +80,9 @@ func main() {
 	http.HandleFunc("POST /storage/v1/object/{bucket}/{filename}", handleUpload)
 	http.HandleFunc("GET /storage/v1/object/{bucket}/{filename}", handleDownload)
 	http.HandleFunc("DELETE /storage/v1/object/{bucket}/{filename}", handleDelete)
+
+	// Signed URL generator endpoint
+	http.HandleFunc("POST /storage/v1/object/sign/{bucket}/{filename}", handleSignURL)
 
 	log.Printf("Storage Service starting on port %s...", port)
 	if err := http.ListenAndServe(":"+port, nil); err != nil {
@@ -134,7 +144,7 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Upload binary stream to MinIO
+	// Upload binary stream to SeaweedFS/S3
 	_, err = storageS3.Client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket: &bucketName,
 		Key:    &filename,
@@ -194,9 +204,46 @@ func handleDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Enforce Bucket ACL check
+	if !isBucketPublic(bucketName) {
+		authorized := false
+		tokenStr := r.URL.Query().Get("token")
+
+		// 1. Check if token is a specialized signed-url token
+		if tokenStr != "" && verifySignedToken(tokenStr, bucketName, filename) {
+			authorized = true
+		}
+
+		// 2. If not signed, check caller identity via Bearer JWT
+		if !authorized {
+			uid, err := authenticateRequest(r)
+			if err == nil && uid != "anon" {
+				// Fetch file metadata from Couchbase to verify owner
+				if storageDB.Instance != nil && storageDB.Instance.Bucket != nil {
+					var meta FileMetadata
+					scopeObj := storageDB.Instance.Bucket.Scope("storage")
+					colObj := scopeObj.Collection("objects")
+					metaID := bucketName + "/" + filename
+
+					err := colObj.Get(metaID, nil).Content(&meta)
+					if err == nil && meta.OwnerID == uid {
+						authorized = true
+					}
+				}
+			}
+		}
+
+		if !authorized {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Access denied by Object Storage ACL policy"})
+			return
+		}
+	}
+
 	ctx := r.Context()
 
-	// Download binary stream from MinIO
+	// Download binary stream from SeaweedFS/S3
 	output, err := storageS3.Client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: &bucketName,
 		Key:    &filename,
@@ -243,7 +290,7 @@ func handleDelete(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 
-	// Delete target object from MinIO
+	// Delete target object from SeaweedFS/S3
 	_, err := storageS3.Client.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: &bucketName,
 		Key:    &filename,
@@ -271,6 +318,75 @@ func handleDelete(w http.ResponseWriter, r *http.Request) {
 		Bucket: bucketName,
 		Key:    filename,
 		Status: "deleted",
+	})
+}
+
+func handleSignURL(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	bucketName := r.PathValue("bucket")
+	filename := r.PathValue("filename")
+
+	if bucketName == "" || filename == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "Bucket and filename parameters are required"})
+		return
+	}
+
+	uid, err := authenticateRequest(r)
+	if err != nil || uid == "anon" {
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "Authentication is required to sign URLs"})
+		return
+	}
+
+	// Fetch file metadata from Couchbase to verify owner
+	if storageDB.Instance != nil && storageDB.Instance.Bucket != nil {
+		var meta FileMetadata
+		scopeObj := storageDB.Instance.Bucket.Scope("storage")
+		colObj := scopeObj.Collection("objects")
+		metaID := bucketName + "/" + filename
+
+		err := colObj.Get(metaID, nil).Content(&meta)
+		if err != nil {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Object metadata not found"})
+			return
+		}
+
+		if meta.OwnerID != uid {
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Only the file owner can generate signed URLs"})
+			return
+		}
+	}
+
+	// Generate signed JWT token valid for 15 minutes
+	secret := os.Getenv("JWT_SECRET")
+	if secret == "" {
+		secret = "super-secret-key-do-not-use-in-production!"
+	}
+
+	claims := SignedURLClaims{
+		Bucket:   bucketName,
+		Filename: filename,
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   "file-download",
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(15 * time.Minute)),
+		},
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	signedToken, err := token.SignedString([]byte(secret))
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: fmt.Sprintf("Failed to sign URL token: %v", err)})
+		return
+	}
+
+	signedURL := fmt.Sprintf("/storage/v1/object/%s/%s?token=%s", bucketName, filename, signedToken)
+	json.NewEncoder(w).Encode(map[string]string{
+		"signedUrl": signedURL,
 	})
 }
 
@@ -304,4 +420,47 @@ func authenticateRequest(r *http.Request) (string, error) {
 	}
 
 	return claims.Subject, nil
+}
+
+// Helper: Check if bucket is marked public in database registry
+func isBucketPublic(bucketName string) bool {
+	if storageDB.Instance == nil || storageDB.Instance.Bucket == nil {
+		return false // Secure by default
+	}
+
+	var cfg models.BucketConfig
+	scopeObj := storageDB.Instance.Bucket.Scope("storage")
+	colObj := scopeObj.Collection("buckets")
+
+	err := colObj.Get(bucketName, nil).Content(&cfg)
+	if err != nil {
+		return false // Secure by default if not explicitly registered public
+	}
+	return cfg.Public
+}
+
+// Helper: Verify specialized signed-url token signature
+func verifySignedToken(tokenStr, bucketName, filename string) bool {
+	secret := os.Getenv("JWT_SECRET")
+	if secret == "" {
+		secret = "super-secret-key-do-not-use-in-production!"
+	}
+
+	token, err := jwt.ParseWithClaims(tokenStr, &SignedURLClaims{}, func(token *jwt.Token) (interface{}, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+		}
+		return []byte(secret), nil
+	})
+
+	if err != nil || !token.Valid {
+		return false
+	}
+
+	claims, ok := token.Claims.(*SignedURLClaims)
+	if !ok {
+		return false
+	}
+
+	return claims.Subject == "file-download" && claims.Bucket == bucketName && claims.Filename == filename
 }

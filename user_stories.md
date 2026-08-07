@@ -220,7 +220,7 @@ This document provides the complete specification for all features organized as 
   - `[ ]` Implement multipart upload endpoint and Couchbase metadata write
 
 ### US-5.2: Public & Private File ACL Policy
-- **Status**: `[ ]` Open
+- **Status**: `[x]` Completed
 - **User Story**: *As a developer, I want to configure public access or signed URL access for stored files.*
 - **Prerequisites**: US-5.1
 - **Acceptance Criteria**:
