@@ -207,7 +207,7 @@ This document provides the complete specification for all features organized as 
 ## Epic 5: Storage Service (Object Storage)
 
 ### US-5.1: File Upload & Metadata Storage
-- **Status**: `[ ]` Open
+- **Status**: `[x]` Completed
 - **User Story**: *As a developer, I want users to upload binary files into storage buckets with metadata tracked in Couchbase.*
 - **Prerequisites**: US-2.2
 - **Acceptance Criteria**:
