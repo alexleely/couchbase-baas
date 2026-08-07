@@ -237,7 +237,7 @@ This document provides the complete specification for all features organized as 
 ## Epic 6: Developer Console (Dashboard UI)
 
 ### US-6.1: Database Explorer & Document Editor
-- **Status**: `[ ]` Open
+- **Status**: `[x]` Completed
 - **User Story**: *As a developer, I want a web dashboard to browse scopes, collections, and edit JSON documents inline.*
 - **Prerequisites**: US-3.1
 - **Acceptance Criteria**:

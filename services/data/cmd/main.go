@@ -53,6 +53,9 @@ func main() {
 	// System endpoints
 	http.HandleFunc("GET /health", handleHealth)
 
+	// Schema discovery endpoint
+	http.HandleFunc("GET /rest/v1/db/schema", handleSchema)
+
 	// REST CRUD Dynamic endpoints (Go 1.22 path patterns)
 	http.HandleFunc("POST /rest/v1/db/{scope}/{collection}", handleCreate)
 	http.HandleFunc("GET /rest/v1/db/{scope}/{collection}", handleList)
@@ -79,8 +82,87 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// GET /rest/v1/db/schema
+func handleSchema(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Headers", "*")
+	w.Header().Set("Content-Type", "application/json")
+
+	bucketName := os.Getenv("COUCHBASE_BUCKET")
+	if bucketName == "" {
+		bucketName = "default"
+	}
+
+	// Query scopes
+	scopeQuery := fmt.Sprintf("SELECT name FROM system:scopes WHERE bucket = '%s'", bucketName)
+	rows, err := db.Instance.Cluster.Query(scopeQuery, nil)
+	if err != nil {
+		// Fallback setup in case system catalogs query is restricted
+		results := []map[string]interface{}{
+			{"name": "_default", "collections": []string{"_default"}},
+			{"name": "auth", "collections": []string{"users", "sessions", "policies"}},
+			{"name": "storage", "collections": []string{"objects", "buckets"}},
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{"scopes": results})
+		return
+	}
+	defer rows.Close()
+
+	type Scope struct {
+		Name        string   `json:"name"`
+		Collections []string `json:"collections"`
+	}
+
+	scopesMap := make(map[string]*Scope)
+	for rows.Next() {
+		var row struct {
+			Name string `json:"name"`
+		}
+		if err := rows.Row(&row); err == nil {
+			if !strings.HasPrefix(row.Name, "_") || row.Name == "_default" {
+				scopesMap[row.Name] = &Scope{Name: row.Name, Collections: []string{}}
+			}
+		}
+	}
+
+	// Query collections (keyspaces)
+	keyspaceQuery := fmt.Sprintf("SELECT name, scope FROM system:keyspaces WHERE bucket = '%s'", bucketName)
+	krows, err := db.Instance.Cluster.Query(keyspaceQuery, nil)
+	if err == nil {
+		defer krows.Close()
+		for krows.Next() {
+			var row struct {
+				Name  string `json:"name"`
+				Scope string `json:"scope"`
+			}
+			if err := krows.Row(&row); err == nil {
+				if sc, ok := scopesMap[row.Scope]; ok {
+					sc.Collections = append(sc.Collections, row.Name)
+				}
+			}
+		}
+	}
+
+	var results []Scope
+	for _, sc := range scopesMap {
+		results = append(results, *sc)
+	}
+
+	if len(results) == 0 {
+		results = []Scope{
+			{Name: "_default", Collections: []string{"_default"}},
+			{Name: "auth", Collections: []string{"users", "sessions", "policies"}},
+			{Name: "storage", Collections: []string{"objects", "buckets"}},
+		}
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{"scopes": results})
+}
+
 // POST /rest/v1/db/{scope}/{collection}
 func handleCreate(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Headers", "*")
 	w.Header().Set("Content-Type", "application/json")
 
 	scopeName := r.PathValue("scope")
@@ -147,6 +229,8 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 
 // GET /rest/v1/db/{scope}/{collection} (Query translation and document listing)
 func handleList(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Headers", "*")
 	w.Header().Set("Content-Type", "application/json")
 
 	scopeName := r.PathValue("scope")
@@ -165,7 +249,10 @@ func handleList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	bucketName := os.Getenv("COUCHBASE_BUCKET")
+	bucketName := os.Getenv("COUCHBASE_CONTAINER_BUCKET")
+	if bucketName == "" {
+		bucketName = os.Getenv("COUCHBASE_BUCKET")
+	}
 	if bucketName == "" {
 		bucketName = "default"
 	}
@@ -216,6 +303,8 @@ func handleList(w http.ResponseWriter, r *http.Request) {
 
 // GET /rest/v1/db/{scope}/{collection}/{id}
 func handleRead(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Headers", "*")
 	w.Header().Set("Content-Type", "application/json")
 
 	scopeName := r.PathValue("scope")
@@ -238,7 +327,6 @@ func handleRead(w http.ResponseWriter, r *http.Request) {
 	scopeObj := db.Instance.Bucket.Scope(scopeName)
 	collectionObj := scopeObj.Collection(collectionName)
 
-	// Check if sub-document query path is requested
 	path := r.URL.Query().Get("path")
 	if path != "" {
 		res, err := collectionObj.LookupIn(id, []gocb.LookupInSpec{
@@ -338,6 +426,8 @@ func handleRead(w http.ResponseWriter, r *http.Request) {
 
 // PUT /rest/v1/db/{scope}/{collection}/{id}
 func handleUpdate(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Headers", "*")
 	w.Header().Set("Content-Type", "application/json")
 
 	scopeName := r.PathValue("scope")
@@ -415,6 +505,8 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 
 // PATCH /rest/v1/db/{scope}/{collection}/{id}
 func handlePatch(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Headers", "*")
 	w.Header().Set("Content-Type", "application/json")
 
 	scopeName := r.PathValue("scope")
@@ -476,7 +568,7 @@ func handlePatch(w http.ResponseWriter, r *http.Request) {
 		specs = append(specs, gocb.UpsertSpec(path, val, nil))
 	}
 
-	_, err := collectionObj.MutateIn(id, specs, nil)
+	_, err = collectionObj.MutateIn(id, specs, nil)
 	if err != nil {
 		log.Printf("Sub-document MutateIn failed: %v", err)
 		if errors.Is(err, gocb.ErrDocumentNotFound) {
@@ -506,6 +598,8 @@ func handlePatch(w http.ResponseWriter, r *http.Request) {
 
 // DELETE /rest/v1/db/{scope}/{collection}/{id}
 func handleDelete(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Headers", "*")
 	w.Header().Set("Content-Type", "application/json")
 
 	scopeName := r.PathValue("scope")
@@ -579,6 +673,8 @@ func handleDelete(w http.ResponseWriter, r *http.Request) {
 
 // POST /rest/v1/db/query
 func handleQuery(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Headers", "*")
 	w.Header().Set("Content-Type", "application/json")
 
 	var req models.QueryRequest
@@ -687,7 +783,10 @@ func authenticateRequest(r *http.Request) (string, string, error) {
 
 // Helper: Retrieve active RLS policies from Couchbase
 func fetchCollectionPolicies(scopeName, collectionName, action string) ([]models.Policy, error) {
-	bucketName := os.Getenv("COUCHBASE_BUCKET")
+	bucketName := os.Getenv("COUCHBASE_CONTAINER_BUCKET")
+	if bucketName == "" {
+		bucketName = os.Getenv("COUCHBASE_BUCKET")
+	}
 	if bucketName == "" {
 		bucketName = "default"
 	}
