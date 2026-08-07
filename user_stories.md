@@ -164,7 +164,7 @@ This document provides the complete specification for all features organized as 
 ## Epic 4: Realtime Service (WebSockets & Mutations)
 
 ### US-4.1: WebSocket Connection & Handshake
-- **Status**: `[ ]` Open
+- **Status**: `[x]` Completed
 - **User Story**: *As a client SDK, I want to establish a persistent WebSocket connection to receive live database changes.*
 - **Prerequisites**: US-2.2
 - **Acceptance Criteria**:
