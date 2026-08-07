@@ -99,12 +99,10 @@ func TestURLQueryTranslator(t *testing.T) {
 		t.Fatalf("failed to parse URL query values: %v", err)
 	}
 
-	// Verify projections
 	if !strings.Contains(stmt, "SELECT `id`, `name`, `age` FROM") {
 		t.Errorf("projection fields parsing failed, got: %s", stmt)
 	}
 
-	// Verify order, limit, offset
 	if !strings.Contains(stmt, "ORDER BY `created_at` DESC") {
 		t.Errorf("order parsing failed, got: %s", stmt)
 	}
@@ -115,12 +113,39 @@ func TestURLQueryTranslator(t *testing.T) {
 		t.Errorf("offset parsing failed, got: %s", stmt)
 	}
 
-	// Verify WHERE predicates
 	if !strings.Contains(stmt, "`age` >= $") || !strings.Contains(stmt, "`status` = $") {
 		t.Errorf("WHERE predicates parsing failed, got: %s", stmt)
 	}
 
 	if len(params) != 2 {
 		t.Errorf("expected 2 bound query parameters, got: %d", len(params))
+	}
+}
+
+func TestPatchInvalidJSON(t *testing.T) {
+	req, err := http.NewRequest("PATCH", "/rest/v1/db/myscope/mycol/myid", bytes.NewBuffer([]byte("{invalid-json}")))
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+
+	rr := httptest.NewRecorder()
+	handlePatch(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("expected status code 400 for invalid PATCH body, got: %d", rr.Code)
+	}
+}
+
+func TestPatchEmptyBody(t *testing.T) {
+	req, err := http.NewRequest("PATCH", "/rest/v1/db/myscope/mycol/myid", bytes.NewBuffer([]byte("{}")))
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+
+	rr := httptest.NewRecorder()
+	handlePatch(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("expected status code 400 for empty PATCH body, got: %d", rr.Code)
 	}
 }

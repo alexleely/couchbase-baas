@@ -133,7 +133,7 @@ This document provides the complete specification for all features organized as 
   - `[ ]` Add unit tests for query translation logic
 
 ### US-3.3: Key-Value (KV) & Sub-Document Fast Path
-- **Status**: `[ ]` Open
+- **Status**: `[x]` Completed
 - **User Story**: *As a developer, I want direct single-document CRUD requests to bypass SQL++ and use Couchbase Key-Value (KV) API for sub-millisecond performance.*
 - **Prerequisites**: US-3.1
 - **Acceptance Criteria**:

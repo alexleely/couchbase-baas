@@ -51,6 +51,7 @@ func main() {
 	http.HandleFunc("GET /rest/v1/db/{scope}/{collection}", handleList)
 	http.HandleFunc("GET /rest/v1/db/{scope}/{collection}/{id}", handleRead)
 	http.HandleFunc("PUT /rest/v1/db/{scope}/{collection}/{id}", handleUpdate)
+	http.HandleFunc("PATCH /rest/v1/db/{scope}/{collection}/{id}", handlePatch)
 	http.HandleFunc("DELETE /rest/v1/db/{scope}/{collection}/{id}", handleDelete)
 
 	// SQL++ query endpoint
@@ -210,6 +211,43 @@ func handleRead(w http.ResponseWriter, r *http.Request) {
 	scopeObj := db.Instance.Bucket.Scope(scopeName)
 	collectionObj := scopeObj.Collection(collectionName)
 
+	// Check if sub-document query path is requested
+	path := r.URL.Query().Get("path")
+	if path != "" {
+		res, err := collectionObj.LookupIn(id, []gocb.LookupInSpec{
+			gocb.GetSpec(path, nil),
+		}, nil)
+		if err != nil {
+			log.Printf("Sub-document LookupIn failed: %v", err)
+			if errors.Is(err, gocb.ErrDocumentNotFound) {
+				w.WriteHeader(http.StatusNotFound)
+				json.NewEncoder(w).Encode(ErrorResponse{Error: "Document not found"})
+				return
+			}
+			if errors.Is(err, gocb.ErrPathNotFound) || strings.Contains(err.Error(), "path not found") {
+				w.WriteHeader(http.StatusNotFound)
+				json.NewEncoder(w).Encode(ErrorResponse{Error: fmt.Sprintf("Path '%s' not found inside document", path)})
+				return
+			}
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to query sub-document path"})
+			return
+		}
+
+		var val interface{}
+		err = res.ContentAt(0, &val)
+		if err != nil {
+			log.Printf("Sub-document content extraction failed: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to extract sub-document path content"})
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(val)
+		return
+	}
+
 	var doc map[string]interface{}
 	err := collectionObj.Get(id, nil).Content(&doc)
 	if err != nil {
@@ -277,6 +315,66 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(CRUDResponse{
 		ID:     id,
 		Status: "upserted",
+	})
+}
+
+// PATCH /rest/v1/db/{scope}/{collection}/{id} (Sub-document updates)
+func handlePatch(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	scopeName := r.PathValue("scope")
+	collectionName := r.PathValue("collection")
+	id := r.PathValue("id")
+
+	if scopeName == "" || collectionName == "" || id == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "Scope, collection, and document ID parameters are required"})
+		return
+	}
+
+	var patchMap map[string]interface{}
+	if err := json.NewDecoder(r.Body).Decode(&patchMap); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "Invalid JSON request body"})
+		return
+	}
+
+	if len(patchMap) == 0 {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "PATCH body must contain at least one modification path"})
+		return
+	}
+
+	scopeObj := db.Instance.Bucket.Scope(scopeName)
+	collectionObj := scopeObj.Collection(collectionName)
+
+	var specs []gocb.MutateInSpec
+	for path, val := range patchMap {
+		specs = append(specs, gocb.UpsertSpec(path, val, nil))
+	}
+
+	_, err := collectionObj.MutateIn(id, specs, nil)
+	if err != nil {
+		log.Printf("Sub-document MutateIn failed: %v", err)
+		if errors.Is(err, gocb.ErrDocumentNotFound) {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Document not found"})
+			return
+		}
+		if errors.Is(err, gocb.ErrCollectionNotFound) || errors.Is(err, gocb.ErrScopeNotFound) || strings.Contains(err.Error(), "not found") {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: fmt.Sprintf("Scope '%s' or collection '%s' does not exist", scopeName, collectionName)})
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to mutate sub-document paths"})
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(CRUDResponse{
+		ID:     id,
+		Status: "mutated",
 	})
 }
 
@@ -434,7 +532,6 @@ func parseURLQuery(queryValues url.Values, bucketName, scope, collection string)
 				}
 			}
 
-			// Add dynamic document path check or key binding
 			whereClauses = append(whereClauses, fmt.Sprintf("`%s` %s $%d", key, op, paramIndex))
 			params = append(params, compareVal)
 			paramIndex++
