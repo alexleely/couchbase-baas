@@ -250,7 +250,7 @@ This document provides the complete specification for all features organized as 
   - `[ ]` Build document grid view and Monaco JSON Editor integration
 
 ### US-6.2: Auth & SSO Management Panel
-- **Status**: `[ ]` Open
+- **Status**: `[x]` Completed
 - **User Story**: *As an admin, I want to manage registered users, configure OIDC clients, and upload SAML metadata via the web UI.*
 - **Prerequisites**: US-2.3, US-2.4
 - **Acceptance Criteria**:
