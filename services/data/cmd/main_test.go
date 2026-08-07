@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strings"
 	"testing"
 )
 
@@ -34,7 +36,6 @@ func TestCreateInvalidJSON(t *testing.T) {
 	}
 
 	rr := httptest.NewRecorder()
-	// Set Go 1.22 path values mock if using standard ServeMux, but direct call is simple
 	handleCreate(rr, req)
 
 	if rr.Code != http.StatusBadRequest {
@@ -53,5 +54,73 @@ func TestUpdateInvalidJSON(t *testing.T) {
 
 	if rr.Code != http.StatusBadRequest {
 		t.Errorf("expected status code 400 for invalid JSON body on update, got: %d", rr.Code)
+	}
+}
+
+func TestQueryInvalidJSON(t *testing.T) {
+	req, err := http.NewRequest("POST", "/rest/v1/db/query", bytes.NewBuffer([]byte("{invalid-json}")))
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+
+	rr := httptest.NewRecorder()
+	handleQuery(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("expected status code 400 for invalid query JSON body, got: %d", rr.Code)
+	}
+}
+
+func TestQueryEmptyStatement(t *testing.T) {
+	req, err := http.NewRequest("POST", "/rest/v1/db/query", bytes.NewBuffer([]byte(`{"statement":""}`)))
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+
+	rr := httptest.NewRecorder()
+	handleQuery(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("expected status code 400 for empty query statement, got: %d", rr.Code)
+	}
+}
+
+func TestURLQueryTranslator(t *testing.T) {
+	values := url.Values{}
+	values.Add("select", "id,name,age")
+	values.Add("age", "gte.18")
+	values.Add("status", "eq.active")
+	values.Add("order", "created_at.desc")
+	values.Add("limit", "10")
+	values.Add("offset", "5")
+
+	stmt, params, err := parseURLQuery(values, "default", "myscope", "mycollection")
+	if err != nil {
+		t.Fatalf("failed to parse URL query values: %v", err)
+	}
+
+	// Verify projections
+	if !strings.Contains(stmt, "SELECT `id`, `name`, `age` FROM") {
+		t.Errorf("projection fields parsing failed, got: %s", stmt)
+	}
+
+	// Verify order, limit, offset
+	if !strings.Contains(stmt, "ORDER BY `created_at` DESC") {
+		t.Errorf("order parsing failed, got: %s", stmt)
+	}
+	if !strings.Contains(stmt, "LIMIT 10") {
+		t.Errorf("limit parsing failed, got: %s", stmt)
+	}
+	if !strings.Contains(stmt, "OFFSET 5") {
+		t.Errorf("offset parsing failed, got: %s", stmt)
+	}
+
+	// Verify WHERE predicates
+	if !strings.Contains(stmt, "`age` >= $") || !strings.Contains(stmt, "`status` = $") {
+		t.Errorf("WHERE predicates parsing failed, got: %s", stmt)
+	}
+
+	if len(params) != 2 {
+		t.Errorf("expected 2 bound query parameters, got: %d", len(params))
 	}
 }

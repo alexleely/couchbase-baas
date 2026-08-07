@@ -119,7 +119,7 @@ This document provides the complete specification for all features organized as 
   - `[ ]` Add standard HTTP error responses (404 Not Found, 400 Bad Request)
 
 ### US-3.2: URL Query Parameter to N1QL/SQL++ Translation
-- **Status**: `[ ]` Open
+- **Status**: `[x]` Completed
 - **User Story**: *As a frontend developer, I want to filter, sort, and paginate database queries using HTTP query parameters.*
 - **Prerequisites**: US-3.1
 - **Acceptance Criteria**:

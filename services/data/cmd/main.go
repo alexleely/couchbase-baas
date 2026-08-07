@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/google/uuid"
 
 	"data/internal/db"
+	"data/internal/models"
 )
 
 type HealthResponse struct {
@@ -46,9 +48,13 @@ func main() {
 
 	// REST CRUD Dynamic endpoints (Go 1.22 path patterns)
 	http.HandleFunc("POST /rest/v1/db/{scope}/{collection}", handleCreate)
+	http.HandleFunc("GET /rest/v1/db/{scope}/{collection}", handleList)
 	http.HandleFunc("GET /rest/v1/db/{scope}/{collection}/{id}", handleRead)
 	http.HandleFunc("PUT /rest/v1/db/{scope}/{collection}/{id}", handleUpdate)
 	http.HandleFunc("DELETE /rest/v1/db/{scope}/{collection}/{id}", handleDelete)
+
+	// SQL++ query endpoint
+	http.HandleFunc("POST /rest/v1/db/query", handleQuery)
 
 	log.Printf("Data API Service starting on port %s...", port)
 	if err := http.ListenAndServe(":"+port, nil); err != nil {
@@ -126,6 +132,65 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 		ID:     id,
 		Status: "created",
 	})
+}
+
+// GET /rest/v1/db/{scope}/{collection} (Query translation and document listing)
+func handleList(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	scopeName := r.PathValue("scope")
+	collectionName := r.PathValue("collection")
+
+	if scopeName == "" || collectionName == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "Scope and collection parameters are required"})
+		return
+	}
+
+	bucketName := os.Getenv("COUCHBASE_BUCKET")
+	if bucketName == "" {
+		bucketName = "default"
+	}
+
+	// Translate URL parameters to N1QL/SQL++
+	statement, params, err := parseURLQuery(r.URL.Query(), bucketName, scopeName, collectionName)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: fmt.Sprintf("Failed to parse query parameters: %v", err)})
+		return
+	}
+
+	opts := gocb.QueryOptions{}
+	if len(params) > 0 {
+		opts.PositionalParameters = params
+	}
+
+	rows, err := db.Instance.Cluster.Query(statement, &opts)
+	if err != nil {
+		log.Printf("List query failed: %v (Statement: %s)", err, statement)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: fmt.Sprintf("Database query failed: %v", err)})
+		return
+	}
+	defer rows.Close()
+
+	var results []interface{}
+	for rows.Next() {
+		var row interface{}
+		if err := rows.Row(&row); err != nil {
+			log.Printf("Failed to deserialize row: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to deserialize result rows"})
+			return
+		}
+		results = append(results, row)
+	}
+
+	w.WriteHeader(http.StatusOK)
+	if results == nil {
+		results = []interface{}{}
+	}
+	json.NewEncoder(w).Encode(results)
 }
 
 // GET /rest/v1/db/{scope}/{collection}/{id}
@@ -255,4 +320,152 @@ func handleDelete(w http.ResponseWriter, r *http.Request) {
 		ID:     id,
 		Status: "deleted",
 	})
+}
+
+// POST /rest/v1/db/query
+func handleQuery(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	var req models.QueryRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "Invalid JSON request body"})
+		return
+	}
+
+	req.Statement = strings.TrimSpace(req.Statement)
+	if req.Statement == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "SQL++ statement is required"})
+		return
+	}
+
+	opts := gocb.QueryOptions{}
+	if len(req.Parameters) > 0 {
+		opts.PositionalParameters = req.Parameters
+	}
+	if len(req.NamedParameters) > 0 {
+		opts.NamedParameters = req.NamedParameters
+	}
+
+	rows, err := db.Instance.Cluster.Query(req.Statement, &opts)
+	if err != nil {
+		log.Printf("SQL++ query execution failed: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: fmt.Sprintf("Query execution failed: %v", err)})
+		return
+	}
+	defer rows.Close()
+
+	var results []interface{}
+	for rows.Next() {
+		var row interface{}
+		if err := rows.Row(&row); err != nil {
+			log.Printf("Failed to deserialize row: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to deserialize result rows"})
+			return
+		}
+		results = append(results, row)
+	}
+
+	if err := rows.Err(); err != nil {
+		log.Printf("Error during row iteration: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "Error reading results"})
+		return
+	}
+
+	resp := models.QueryResponse{
+		Results: results,
+	}
+
+	metadata, err := rows.Metadata()
+	if err == nil && metadata != nil {
+		resp.Metadata = &models.QueryMetadata{
+			RequestID:       metadata.RequestID,
+			ClientContextID: metadata.ClientContextID,
+			Status:          string(metadata.Status),
+			Metrics:         metadata.Metrics,
+		}
+	}
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(resp)
+}
+
+// URL query parameter translator helper
+func parseURLQuery(queryValues url.Values, bucketName, scope, collection string) (string, []interface{}, error) {
+	selectFields := "*"
+	if selectVal := queryValues.Get("select"); selectVal != "" {
+		fields := strings.Split(selectVal, ",")
+		for i, f := range fields {
+			fields[i] = fmt.Sprintf("`%s`", strings.TrimSpace(f))
+		}
+		selectFields = strings.Join(fields, ", ")
+	}
+
+	var whereClauses []string
+	var params []interface{}
+	paramIndex := 1
+
+	operators := map[string]string{
+		"eq":   "=",
+		"neq":  "!=",
+		"gt":   ">",
+		"gte":  ">=",
+		"lt":   "<",
+		"lte":  "<=",
+		"like": "LIKE",
+	}
+
+	for key, values := range queryValues {
+		if key == "select" || key == "order" || key == "limit" || key == "offset" {
+			continue
+		}
+
+		for _, val := range values {
+			op := "="
+			compareVal := val
+			if parts := strings.SplitN(val, ".", 2); len(parts) == 2 {
+				if mappedOp, ok := operators[parts[0]]; ok {
+					op = mappedOp
+					compareVal = parts[1]
+				}
+			}
+
+			// Add dynamic document path check or key binding
+			whereClauses = append(whereClauses, fmt.Sprintf("`%s` %s $%d", key, op, paramIndex))
+			params = append(params, compareVal)
+			paramIndex++
+		}
+	}
+
+	// Build SQL++ statement
+	stmt := fmt.Sprintf("SELECT %s FROM `%s`.`%s`.`%s`", selectFields, bucketName, scope, collection)
+	if len(whereClauses) > 0 {
+		stmt += " WHERE " + strings.Join(whereClauses, " AND ")
+	}
+
+	if orderVal := queryValues.Get("order"); orderVal != "" {
+		parts := strings.Split(orderVal, ".")
+		field := parts[0]
+		direction := "ASC"
+		if len(parts) > 1 && strings.ToUpper(parts[1]) == "DESC" {
+			direction = "DESC"
+		}
+		stmt += fmt.Sprintf(" ORDER BY `%s` %s", field, direction)
+	}
+
+	limit := "100"
+	if limitVal := queryValues.Get("limit"); limitVal != "" {
+		limit = limitVal
+	}
+	stmt += fmt.Sprintf(" LIMIT %s", limit)
+
+	if offsetVal := queryValues.Get("offset"); offsetVal != "" {
+		stmt += fmt.Sprintf(" OFFSET %s", offsetVal)
+	}
+
+	return stmt, params, nil
 }
