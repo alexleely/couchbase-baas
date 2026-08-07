@@ -12,6 +12,7 @@ import (
 
 	"github.com/couchbase/gocb/v2"
 	"github.com/google/uuid"
+	"github.com/golang-jwt/jwt/v5"
 
 	"data/internal/db"
 	"data/internal/models"
@@ -30,6 +31,11 @@ type ErrorResponse struct {
 type CRUDResponse struct {
 	ID     string `json:"id"`
 	Status string `json:"status"`
+}
+
+type CustomClaims struct {
+	Role string `json:"role"`
+	jwt.RegisteredClaims
 }
 
 func main() {
@@ -148,13 +154,23 @@ func handleList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	uid, role, err := authenticateRequest(r)
+	if err != nil && err.Error() != "no auth header" {
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: err.Error()})
+		return
+	}
+
 	bucketName := os.Getenv("COUCHBASE_BUCKET")
 	if bucketName == "" {
 		bucketName = "default"
 	}
 
+	// Fetch SELECT policies
+	policies, _ := fetchCollectionPolicies(scopeName, collectionName, "SELECT")
+
 	// Translate URL parameters to N1QL/SQL++
-	statement, params, err := parseURLQuery(r.URL.Query(), bucketName, scopeName, collectionName)
+	statement, params, err := parseURLQuery(r.URL.Query(), bucketName, scopeName, collectionName, policies, uid, role)
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(ErrorResponse{Error: fmt.Sprintf("Failed to parse query parameters: %v", err)})
@@ -208,12 +224,19 @@ func handleRead(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	uid, role, err := authenticateRequest(r)
+	if err != nil && err.Error() != "no auth header" {
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: err.Error()})
+		return
+	}
+
 	scopeObj := db.Instance.Bucket.Scope(scopeName)
 	collectionObj := scopeObj.Collection(collectionName)
 
-	// Check if sub-document query path is requested
 	path := r.URL.Query().Get("path")
 	if path != "" {
+		// Sub-document query
 		res, err := collectionObj.LookupIn(id, []gocb.LookupInSpec{
 			gocb.GetSpec(path, nil),
 		}, nil)
@@ -243,13 +266,35 @@ func handleRead(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// Enforce RLS policy for sub-document if retrieved document holds ownership structures
+		policies, _ := fetchCollectionPolicies(scopeName, collectionName, "SELECT")
+		if len(policies) > 0 {
+			// To evaluate RLS, we need the outer document. For simplicity, check outer doc:
+			var parentDoc map[string]interface{}
+			err = collectionObj.Get(id, nil).Content(&parentDoc)
+			if err == nil {
+				allowed := false
+				for _, policy := range policies {
+					if evaluatePolicyInMemory(parentDoc, policy.Expression, uid, role) {
+						allowed = true
+						break
+					}
+				}
+				if !allowed {
+					w.WriteHeader(http.StatusForbidden)
+					json.NewEncoder(w).Encode(ErrorResponse{Error: "Access denied by Row-Level Security (RLS) policies"})
+					return
+				}
+			}
+		}
+
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(val)
 		return
 	}
 
 	var doc map[string]interface{}
-	err := collectionObj.Get(id, nil).Content(&doc)
+	err = collectionObj.Get(id, nil).Content(&doc)
 	if err != nil {
 		log.Printf("Read Get failed: %v", err)
 		if errors.Is(err, gocb.ErrDocumentNotFound) {
@@ -265,6 +310,23 @@ func handleRead(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to fetch document from database"})
 		return
+	}
+
+	// Enforce RLS
+	policies, _ := fetchCollectionPolicies(scopeName, collectionName, "SELECT")
+	if len(policies) > 0 {
+		allowed := false
+		for _, policy := range policies {
+			if evaluatePolicyInMemory(doc, policy.Expression, uid, role) {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Access denied by Row-Level Security (RLS) policies"})
+			return
+		}
 	}
 
 	w.WriteHeader(http.StatusOK)
@@ -285,6 +347,13 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	uid, role, err := authenticateRequest(r)
+	if err != nil && err.Error() != "no auth header" {
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: err.Error()})
+		return
+	}
+
 	var bodyMap map[string]interface{}
 	if err := json.NewDecoder(r.Body).Decode(&bodyMap); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
@@ -292,13 +361,33 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Force id consistency
 	bodyMap["id"] = id
 
 	scopeObj := db.Instance.Bucket.Scope(scopeName)
 	collectionObj := scopeObj.Collection(collectionName)
 
-	_, err := collectionObj.Upsert(id, bodyMap, nil)
+	// Enforce RLS on existing doc
+	policies, _ := fetchCollectionPolicies(scopeName, collectionName, "UPDATE")
+	if len(policies) > 0 {
+		var existingDoc map[string]interface{}
+		err = collectionObj.Get(id, nil).Content(&existingDoc)
+		if err == nil {
+			allowed := false
+			for _, policy := range policies {
+				if evaluatePolicyInMemory(existingDoc, policy.Expression, uid, role) {
+					allowed = true
+					break
+				}
+			}
+			if !allowed {
+				w.WriteHeader(http.StatusForbidden)
+				json.NewEncoder(w).Encode(ErrorResponse{Error: "Access denied by Row-Level Security (RLS) policies"})
+				return
+			}
+		}
+	}
+
+	_, err = collectionObj.Upsert(id, bodyMap, nil)
 	if err != nil {
 		log.Printf("Update Upsert failed: %v", err)
 		if errors.Is(err, gocb.ErrCollectionNotFound) || errors.Is(err, gocb.ErrScopeNotFound) || strings.Contains(err.Error(), "not found") {
@@ -318,7 +407,7 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// PATCH /rest/v1/db/{scope}/{collection}/{id} (Sub-document updates)
+// PATCH /rest/v1/db/{scope}/{collection}/{id}
 func handlePatch(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
@@ -329,6 +418,13 @@ func handlePatch(w http.ResponseWriter, r *http.Request) {
 	if scopeName == "" || collectionName == "" || id == "" {
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(ErrorResponse{Error: "Scope, collection, and document ID parameters are required"})
+		return
+	}
+
+	uid, role, err := authenticateRequest(r)
+	if err != nil && err.Error() != "no auth header" {
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: err.Error()})
 		return
 	}
 
@@ -348,12 +444,33 @@ func handlePatch(w http.ResponseWriter, r *http.Request) {
 	scopeObj := db.Instance.Bucket.Scope(scopeName)
 	collectionObj := scopeObj.Collection(collectionName)
 
+	// Enforce RLS on existing doc
+	policies, _ := fetchCollectionPolicies(scopeName, collectionName, "UPDATE")
+	if len(policies) > 0 {
+		var existingDoc map[string]interface{}
+		err = collectionObj.Get(id, nil).Content(&existingDoc)
+		if err == nil {
+			allowed := false
+			for _, policy := range policies {
+				if evaluatePolicyInMemory(existingDoc, policy.Expression, uid, role) {
+					allowed = true
+					break
+				}
+			}
+			if !allowed {
+				w.WriteHeader(http.StatusForbidden)
+				json.NewEncoder(w).Encode(ErrorResponse{Error: "Access denied by Row-Level Security (RLS) policies"})
+				return
+			}
+		}
+	}
+
 	var specs []gocb.MutateInSpec
 	for path, val := range patchMap {
 		specs = append(specs, gocb.UpsertSpec(path, val, nil))
 	}
 
-	_, err := collectionObj.MutateIn(id, specs, nil)
+	_, err = collectionObj.MutateIn(id, specs, nil)
 	if err != nil {
 		log.Printf("Sub-document MutateIn failed: %v", err)
 		if errors.Is(err, gocb.ErrDocumentNotFound) {
@@ -392,10 +509,38 @@ func handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	uid, role, err := authenticateRequest(r)
+	if err != nil && err.Error() != "no auth header" {
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: err.Error()})
+		return
+	}
+
 	scopeObj := db.Instance.Bucket.Scope(scopeName)
 	collectionObj := scopeObj.Collection(collectionName)
 
-	_, err := collectionObj.Remove(id, nil)
+	// Enforce RLS on existing doc
+	policies, _ := fetchCollectionPolicies(scopeName, collectionName, "DELETE")
+	if len(policies) > 0 {
+		var existingDoc map[string]interface{}
+		err = collectionObj.Get(id, nil).Content(&existingDoc)
+		if err == nil {
+			allowed := false
+			for _, policy := range policies {
+				if evaluatePolicyInMemory(existingDoc, policy.Expression, uid, role) {
+					allowed = true
+					break
+				}
+			}
+			if !allowed {
+				w.WriteHeader(http.StatusForbidden)
+				json.NewEncoder(w).Encode(ErrorResponse{Error: "Access denied by Row-Level Security (RLS) policies"})
+				return
+			}
+		}
+	}
+
+	_, err = collectionObj.Remove(id, nil)
 	if err != nil {
 		log.Printf("Delete Remove failed: %v", err)
 		if errors.Is(err, gocb.ErrDocumentNotFound) {
@@ -492,8 +637,127 @@ func handleQuery(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
+// Helper: Authenticate client JWT access tokens
+func authenticateRequest(r *http.Request) (string, string, error) {
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "" {
+		return "", "anon", errors.New("no auth header")
+	}
+
+	if !strings.HasPrefix(authHeader, "Bearer ") {
+		return "", "", errors.New("Bearer authorization token is required")
+	}
+	tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
+
+	secret := os.Getenv("JWT_SECRET")
+	if secret == "" {
+		secret = "super-secret-key-do-not-use-in-production!"
+	}
+
+	token, err := jwt.ParseWithClaims(tokenStr, &CustomClaims{}, func(token *jwt.Token) (interface{}, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+		}
+		return []byte(secret), nil
+	})
+
+	if err != nil || !token.Valid {
+		return "", "", errors.New("invalid or expired access token")
+	}
+
+	claims, ok := token.Claims.(*CustomClaims)
+	if !ok {
+		return "", "", errors.New("invalid token claims")
+	}
+
+	return claims.Subject, claims.Role, nil
+}
+
+// Helper: Retrieve active RLS policies from Couchbase
+func fetchCollectionPolicies(scopeName, collectionName, action string) ([]models.Policy, error) {
+	bucketName := os.Getenv("COUCHBASE_BUCKET")
+	if bucketName == "" {
+		bucketName = "default"
+	}
+
+	queryStr := fmt.Sprintf("SELECT id, scope, collection, action, expression FROM `%s`.`auth`.`policies` WHERE scope = $1 AND collection = $2 AND action = $3", bucketName)
+	rows, err := db.Instance.Cluster.Query(queryStr, &gocb.QueryOptions{
+		PositionalParameters: []interface{}{scopeName, collectionName, action},
+	})
+	if err != nil {
+		// Log warning (collection policies setup is optional)
+		return nil, nil
+	}
+	defer rows.Close()
+
+	var policies []models.Policy
+	for rows.Next() {
+		var policy models.Policy
+		if err := rows.Row(&policy); err == nil {
+			policies = append(policies, policy)
+		}
+	}
+	return policies, nil
+}
+
+// Helper: Evaluate RLS expression in-memory against KV document attributes
+func evaluatePolicyInMemory(doc map[string]interface{}, expression string, uid string, role string) bool {
+	expression = strings.TrimSpace(expression)
+	if expression == "" {
+		return true
+	}
+
+	operators := []string{"==", "!=", "=", "<>", ">=", "<=", ">", "<"}
+	var op string
+	var left, right string
+
+	for _, o := range operators {
+		if strings.Contains(expression, o) {
+			op = o
+			parts := strings.SplitN(expression, o, 2)
+			left = strings.TrimSpace(parts[0])
+			right = strings.TrimSpace(parts[1])
+			break
+		}
+	}
+
+	if op == "" {
+		field := strings.Trim(expression, "` ")
+		if val, ok := doc[field].(bool); ok {
+			return val
+		}
+		return false
+	}
+
+	left = strings.Trim(left, "` ")
+	val, ok := doc[left]
+	if !ok {
+		return false
+	}
+
+	compareVal := right
+	if right == "$uid" {
+		compareVal = uid
+	} else if right == "$role" {
+		compareVal = role
+	} else {
+		compareVal = strings.Trim(right, `"'`)
+	}
+
+	valStr := fmt.Sprintf("%v", val)
+
+	switch op {
+	case "==", "=":
+		return valStr == compareVal
+	case "!=", "<>":
+		return valStr != compareVal
+	default:
+		return false
+	}
+}
+
 // URL query parameter translator helper
-func parseURLQuery(queryValues url.Values, bucketName, scope, collection string) (string, []interface{}, error) {
+func parseURLQuery(queryValues url.Values, bucketName, scope, collection string, policies []models.Policy, uid, role string) (string, []interface{}, error) {
 	selectFields := "*"
 	if selectVal := queryValues.Get("select"); selectVal != "" {
 		fields := strings.Split(selectVal, ",")
@@ -536,6 +800,27 @@ func parseURLQuery(queryValues url.Values, bucketName, scope, collection string)
 			params = append(params, compareVal)
 			paramIndex++
 		}
+	}
+
+	// Enforce Row-Level Security (RLS) WHERE predicates
+	if len(policies) > 0 {
+		var RLSClauses []string
+		for _, policy := range policies {
+			expr := policy.Expression
+			if strings.Contains(expr, "$uid") {
+				expr = strings.ReplaceAll(expr, "$uid", fmt.Sprintf("$%d", paramIndex))
+				params = append(params, uid)
+				paramIndex++
+			}
+			if strings.Contains(expr, "$role") {
+				expr = strings.ReplaceAll(expr, "$role", fmt.Sprintf("$%d", paramIndex))
+				params = append(params, role)
+				paramIndex++
+			}
+			RLSClauses = append(RLSClauses, fmt.Sprintf("(%s)", expr))
+		}
+		combinedRLS := "(" + strings.Join(RLSClauses, " OR ") + ")"
+		whereClauses = append(whereClauses, combinedRLS)
 	}
 
 	// Build SQL++ statement

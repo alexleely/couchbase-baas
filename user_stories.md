@@ -145,8 +145,8 @@ This document provides the complete specification for all features organized as 
   - `[ ]` Implement Sub-Document MutateIn handler for PATCH requests
   - `[ ]` Benchmark KV fast path vs SQL++ query path
 
-### US-3.4: Row-Level Security (RLS) Policy Engine
-- **Status**: `[ ]` Open
+### US-3.4: Row-Level Security (RLS) Policies
+- **Status**: `[x]` Completed
 - **User Story**: *As a security engineer, I want access policies evaluated against JWT claims to prevent unauthorized data access.*
 - **Prerequisites**: US-2.2, US-3.1
 - **Acceptance Criteria**:

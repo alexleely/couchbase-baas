@@ -94,7 +94,7 @@ func TestURLQueryTranslator(t *testing.T) {
 	values.Add("limit", "10")
 	values.Add("offset", "5")
 
-	stmt, params, err := parseURLQuery(values, "default", "myscope", "mycollection")
+	stmt, params, err := parseURLQuery(values, "default", "myscope", "mycollection", nil, "", "")
 	if err != nil {
 		t.Fatalf("failed to parse URL query values: %v", err)
 	}
@@ -147,5 +147,33 @@ func TestPatchEmptyBody(t *testing.T) {
 
 	if rr.Code != http.StatusBadRequest {
 		t.Errorf("expected status code 400 for empty PATCH body, got: %d", rr.Code)
+	}
+}
+
+func TestRLSPolicyEvaluator(t *testing.T) {
+	doc := map[string]interface{}{
+		"owner_id":  "usr_abc",
+		"role":      "admin",
+		"is_public": true,
+	}
+
+	// Test owner_id policy match
+	if !evaluatePolicyInMemory(doc, "owner_id = $uid", "usr_abc", "") {
+		t.Errorf("expected owner_id policy to be allowed for usr_abc")
+	}
+
+	// Test owner_id policy mismatch
+	if evaluatePolicyInMemory(doc, "owner_id = $uid", "usr_xyz", "") {
+		t.Errorf("expected owner_id policy to be blocked for usr_xyz")
+	}
+
+	// Test role policy match
+	if !evaluatePolicyInMemory(doc, "role == $role", "", "admin") {
+		t.Errorf("expected role policy to match for admin")
+	}
+
+	// Test static boolean evaluation
+	if !evaluatePolicyInMemory(doc, "is_public", "", "") {
+		t.Errorf("expected is_public boolean flag to evaluate to true")
 	}
 }
