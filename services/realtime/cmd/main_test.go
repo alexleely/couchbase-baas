@@ -89,3 +89,32 @@ func TestCDCGatewayValidation(t *testing.T) {
 		t.Errorf("expected status code 400 for missing collection parameter, got: %d", resp.StatusCode)
 	}
 }
+
+func TestRealtimeRLSEvaluator(t *testing.T) {
+	// Stub evaluatePolicyInMemory checker logic
+	doc := map[string]interface{}{
+		"owner_id":  "usr_456",
+		"role":      "editor",
+		"is_public": true,
+	}
+
+	// Verify owner mismatch fails
+	if evaluatePolicyInMemory(doc, "owner_id = $uid", "usr_999", "editor") {
+		t.Errorf("expected mismatch owner to be blocked")
+	}
+
+	// Verify owner match succeeds
+	if !evaluatePolicyInMemory(doc, "owner_id = $uid", "usr_456", "editor") {
+		t.Errorf("expected owner usr_456 to be allowed")
+	}
+
+	// Verify static string equality succeeds
+	if !evaluatePolicyInMemory(doc, "role = 'editor'", "usr_999", "editor") {
+		t.Errorf("expected role editor match to be allowed")
+	}
+
+	// Verify role comparison succeeds
+	if !evaluatePolicyInMemory(doc, "role = $role", "usr_999", "editor") {
+		t.Errorf("expected role editor binding to be allowed")
+	}
+}

@@ -44,16 +44,20 @@ type Client struct {
 	// Authenticated User ID
 	UID string
 
+	// Authenticated User Role
+	Role string
+
 	mu sync.RWMutex
 }
 
-func NewClient(hub *Hub, conn *websocket.Conn, uid string) *Client {
+func NewClient(hub *Hub, conn *websocket.Conn, uid string, role string) *Client {
 	return &Client{
 		Hub:           hub,
 		conn:          conn,
 		send:          make(chan BroadcastPayload, 256),
 		subscriptions: make(map[string]bool),
 		UID:           uid,
+		Role:          role,
 	}
 }
 

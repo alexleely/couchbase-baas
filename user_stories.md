@@ -190,7 +190,7 @@ This document provides the complete specification for all features organized as 
   - `[ ]` Implement high-speed in-memory Event Bus / Channel distributor
 
 ### US-4.3: Realtime Channel Subscription & Broadcast
-- **Status**: `[ ]` Open
+- **Status**: `[x]` Completed
 - **User Story**: *As a client application, I want to subscribe to updates on a specific scope/collection and receive live filtered events.*
 - **Prerequisites**: US-4.1, US-4.2
 - **Acceptance Criteria**:

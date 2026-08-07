@@ -10,6 +10,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/websocket"
 
+	"realtime/internal/db"
 	"realtime/internal/realtime"
 )
 
@@ -48,6 +49,11 @@ func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8003"
+	}
+
+	// Initialize Couchbase connection
+	if err := db.InitDB(); err != nil {
+		log.Printf("[Warning] Failed to initialize Couchbase connection: %v. Running in offline/fallback mode.", err)
 	}
 
 	// Initialize WebSockets Hub
@@ -89,7 +95,7 @@ func serveWs(hub *realtime.Hub, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	uid, err := verifyToken(tokenStr)
+	uid, role, err := verifyToken(tokenStr)
 	if err != nil {
 		w.WriteHeader(http.StatusUnauthorized)
 		w.Write([]byte(fmt.Sprintf("Authentication failed: %v", err)))
@@ -102,7 +108,7 @@ func serveWs(hub *realtime.Hub, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	client := realtime.NewClient(hub, conn, uid)
+	client := realtime.NewClient(hub, conn, uid, role)
 	hub.RegisterClient(client)
 
 	go client.WritePump()
@@ -137,7 +143,7 @@ func handleCDCGateway(hub *realtime.Hub, w http.ResponseWriter, r *http.Request)
 	json.NewEncoder(w).Encode(map[string]string{"status": "broadcasted"})
 }
 
-func verifyToken(tokenStr string) (string, error) {
+func verifyToken(tokenStr string) (string, string, error) {
 	secret := os.Getenv("JWT_SECRET")
 	if secret == "" {
 		secret = "super-secret-key-do-not-use-in-production!"
@@ -151,13 +157,13 @@ func verifyToken(tokenStr string) (string, error) {
 	})
 
 	if err != nil || !token.Valid {
-		return "", fmt.Errorf("invalid or expired token")
+		return "", "", fmt.Errorf("invalid or expired token")
 	}
 
 	claims, ok := token.Claims.(*CustomClaims)
 	if !ok {
-		return "", fmt.Errorf("invalid token claims")
+		return "", "", fmt.Errorf("invalid token claims")
 	}
 
-	return claims.Subject, nil
+	return claims.Subject, claims.Role, nil
 }
