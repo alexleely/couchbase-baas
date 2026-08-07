@@ -14,15 +14,24 @@ import (
 var Client *s3.Client
 
 func InitS3() error {
-	endpoint := os.Getenv("MINIO_ENDPOINT")
+	endpoint := os.Getenv("S3_ENDPOINT")
 	if endpoint == "" {
-		endpoint = "http://localhost:9000"
+		endpoint = os.Getenv("MINIO_ENDPOINT")
 	}
-	accessKey := os.Getenv("MINIO_ACCESS_KEY")
+	if endpoint == "" {
+		endpoint = "http://localhost:8333"
+	}
+	accessKey := os.Getenv("S3_ACCESS_KEY")
+	if accessKey == "" {
+		accessKey = os.Getenv("MINIO_ACCESS_KEY")
+	}
 	if accessKey == "" {
 		accessKey = "minioadmin"
 	}
-	secretKey := os.Getenv("MINIO_SECRET_KEY")
+	secretKey := os.Getenv("S3_SECRET_KEY")
+	if secretKey == "" {
+		secretKey = os.Getenv("MINIO_SECRET_KEY")
+	}
 	if secretKey == "" {
 		secretKey = "minioadmin"
 	}

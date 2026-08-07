@@ -14,7 +14,7 @@ This document provides the complete specification for all features organized as 
 - **Acceptance Criteria**:
   1. Monorepo folder layout created for `gateway`, `auth`, `data`, `realtime`, and `storage` services.
   2. Root `go.work` binds all service `go.mod` definitions.
-  3. `docker-compose.yml` configures Couchbase 7.x, MinIO S3, and microservice containers.
+  3. `docker-compose.yml` configures Couchbase 7.x, SeaweedFS S3, and microservice containers.
   4. Each service exposes a working `/health` HTTP endpoint.
 - **Sub-tasks**:
   - `[x]` Create service folders & `go.mod` files
@@ -212,11 +212,11 @@ This document provides the complete specification for all features organized as 
 - **Prerequisites**: US-2.2
 - **Acceptance Criteria**:
   1. `POST /storage/v1/object/{bucket}/{path}` accepts multipart binary file uploads.
-  2. Binary file is uploaded directly to MinIO/S3 object storage.
+  2. Binary file is uploaded directly to SeaweedFS/S3 object storage.
   3. File metadata (name, size, mime_type, owner_id, bucket, path) is stored in Couchbase `storage.objects` collection.
 - **Sub-tasks**:
   - `[ ]` Add AWS SDK for Go v2 (`aws-sdk-go-v2/service/s3`) to `services/storage`
-  - `[ ]` Implement S3 client initialization for MinIO/S3
+  - `[ ]` Implement S3 client initialization for SeaweedFS/S3
   - `[ ]` Implement multipart upload endpoint and Couchbase metadata write
 
 ### US-5.2: Public & Private File ACL Policy
