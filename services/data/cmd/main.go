@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -134,6 +135,9 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Trigger CDC Event asynchronously
+	go triggerCDCEvent(scopeName, collectionName, "INSERT", id, bodyMap)
+
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(CRUDResponse{
 		ID:     id,
@@ -234,9 +238,9 @@ func handleRead(w http.ResponseWriter, r *http.Request) {
 	scopeObj := db.Instance.Bucket.Scope(scopeName)
 	collectionObj := scopeObj.Collection(collectionName)
 
+	// Check if sub-document query path is requested
 	path := r.URL.Query().Get("path")
 	if path != "" {
-		// Sub-document query
 		res, err := collectionObj.LookupIn(id, []gocb.LookupInSpec{
 			gocb.GetSpec(path, nil),
 		}, nil)
@@ -269,7 +273,6 @@ func handleRead(w http.ResponseWriter, r *http.Request) {
 		// Enforce RLS policy for sub-document if retrieved document holds ownership structures
 		policies, _ := fetchCollectionPolicies(scopeName, collectionName, "SELECT")
 		if len(policies) > 0 {
-			// To evaluate RLS, we need the outer document. For simplicity, check outer doc:
 			var parentDoc map[string]interface{}
 			err = collectionObj.Get(id, nil).Content(&parentDoc)
 			if err == nil {
@@ -400,6 +403,9 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Trigger CDC Event asynchronously
+	go triggerCDCEvent(scopeName, collectionName, "UPDATE", id, bodyMap)
+
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(CRUDResponse{
 		ID:     id,
@@ -470,7 +476,7 @@ func handlePatch(w http.ResponseWriter, r *http.Request) {
 		specs = append(specs, gocb.UpsertSpec(path, val, nil))
 	}
 
-	_, err = collectionObj.MutateIn(id, specs, nil)
+	_, err := collectionObj.MutateIn(id, specs, nil)
 	if err != nil {
 		log.Printf("Sub-document MutateIn failed: %v", err)
 		if errors.Is(err, gocb.ErrDocumentNotFound) {
@@ -487,6 +493,9 @@ func handlePatch(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to mutate sub-document paths"})
 		return
 	}
+
+	// Trigger CDC Event asynchronously (send patched values)
+	go triggerCDCEvent(scopeName, collectionName, "UPDATE", id, patchMap)
 
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(CRUDResponse{
@@ -557,6 +566,9 @@ func handleDelete(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to delete document from database"})
 		return
 	}
+
+	// Trigger CDC Event asynchronously
+	go triggerCDCEvent(scopeName, collectionName, "DELETE", id, nil)
 
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(CRUDResponse{
@@ -685,7 +697,6 @@ func fetchCollectionPolicies(scopeName, collectionName, action string) ([]models
 		PositionalParameters: []interface{}{scopeName, collectionName, action},
 	})
 	if err != nil {
-		// Log warning (collection policies setup is optional)
 		return nil, nil
 	}
 	defer rows.Close()
@@ -850,4 +861,38 @@ func parseURLQuery(queryValues url.Values, bucketName, scope, collection string,
 	}
 
 	return stmt, params, nil
+}
+
+// Asynchronously push mutation details to the Realtime CDC webhook gateway
+func triggerCDCEvent(scope, collection, event, id string, doc interface{}) {
+	realtimeURL := os.Getenv("REALTIME_SERVICE_URL")
+	if realtimeURL == "" {
+		realtimeURL = "http://localhost:8003"
+	}
+	endpoint := realtimeURL + "/realtime/v1/cdc-gateway"
+
+	payload := map[string]interface{}{
+		"scope":      scope,
+		"collection": collection,
+		"event":      event,
+		"id":         id,
+		"doc":        doc,
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("[CDC Warning] Failed to marshal CDC event request body: %v", err)
+		return
+	}
+
+	resp, err := http.Post(endpoint, "application/json", bytes.NewBuffer(body))
+	if err != nil {
+		log.Printf("[CDC Warning] Failed to connect to Realtime CDC webhook: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("[CDC Warning] Realtime CDC gateway returned error status code: %d", resp.StatusCode)
+	}
 }

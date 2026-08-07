@@ -177,7 +177,7 @@ This document provides the complete specification for all features organized as 
   - `[ ]` Build client connection registry and heartbeat manager
 
 ### US-4.2: Couchbase CDC / DCP Mutation Listener
-- **Status**: `[ ]` Open
+- **Status**: `[x]` Completed
 - **User Story**: *As a system, I want to capture Couchbase mutations in real-time using Couchbase DCP or Eventing handlers.*
 - **Prerequisites**: US-4.1
 - **Acceptance Criteria**:

@@ -19,9 +19,21 @@ type HealthResponse struct {
 	Version string `json:"version"`
 }
 
+type ErrorResponse struct {
+	Error string `json:"error"`
+}
+
 type CustomClaims struct {
 	Role string `json:"role"`
 	jwt.RegisteredClaims
+}
+
+type CDCEvent struct {
+	Scope      string                 `json:"scope"`
+	Collection string                 `json:"collection"`
+	Event      string                 `json:"event"` // "INSERT", "UPDATE", "DELETE"
+	ID         string                 `json:"id"`
+	Document   map[string]interface{} `json:"doc,omitempty"`
 }
 
 var upgrader = websocket.Upgrader{
@@ -57,6 +69,11 @@ func main() {
 		serveWs(hub, w, r)
 	})
 
+	// Private CDC Mutation webhook gateway
+	http.HandleFunc("POST /realtime/v1/cdc-gateway", func(w http.ResponseWriter, r *http.Request) {
+		handleCDCGateway(hub, w, r)
+	})
+
 	log.Printf("Realtime Service starting on port %s...", port)
 	if err := http.ListenAndServe(":"+port, nil); err != nil {
 		log.Fatalf("Failed to start realtime service: %v", err)
@@ -90,6 +107,34 @@ func serveWs(hub *realtime.Hub, w http.ResponseWriter, r *http.Request) {
 
 	go client.WritePump()
 	go client.ReadPump()
+}
+
+func handleCDCGateway(hub *realtime.Hub, w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	var event CDCEvent
+	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "Invalid JSON request body"})
+		return
+	}
+
+	if event.Scope == "" || event.Collection == "" || event.Event == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "Scope, collection, and event parameters are required"})
+		return
+	}
+
+	// Broadcast changes to active channel subscribers
+	payload := realtime.BroadcastPayload{
+		Topic:   fmt.Sprintf("db:%s:%s", event.Scope, event.Collection),
+		Event:   event.Event,
+		Payload: event.Document,
+	}
+	hub.Broadcast(payload)
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"status": "broadcasted"})
 }
 
 func verifyToken(tokenStr string) (string, error) {
